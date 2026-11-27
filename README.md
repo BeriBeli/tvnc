@@ -9,6 +9,7 @@ half-blocks.
 
 > [!NOTE]
 > Originally forked from [mishushakov/desktui](https://github.com/mishushakov/desktui).
+> Developed with Gemini 4 Neon, with code reviews by GPT 6.2 Astra.
 
 ## Features
 
