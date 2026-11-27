@@ -228,10 +228,10 @@ mod tests {
     use super::*;
     use crate::ui::chrome::Chrome;
     use crate::ui::theme::probe::{bg, fg};
-    use crate::ui::theme::{Rgb, Theme};
+    use crate::ui::theme::{ColorScheme, Rgb};
 
     fn ink() -> &'static Palette {
-        Theme::Dark.palette()
+        ColorScheme::Dark.palette()
     }
 
     /// What was written in `colour`: everything from where it was set up to the reset
@@ -399,13 +399,13 @@ mod tests {
             &toast,
             &mut Chrome::new(),
             &m,
-            Theme::Light.palette(),
+            ColorScheme::Light.palette(),
         ));
         let text = String::from_utf8(out).unwrap();
-        let light = Theme::Light.palette();
+        let light = ColorScheme::Light.palette();
         assert!(text.contains(&bg(light.paper)) && text.contains(&fg(light.ink)));
         assert!(
-            !text.contains(&bg(Theme::Dark.palette().paper)),
+            !text.contains(&bg(ColorScheme::Dark.palette().paper)),
             "the dark paper has no business in a light session: {text:?}"
         );
     }

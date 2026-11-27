@@ -100,7 +100,7 @@ pub struct Layout {
     pub src_w: u32,
     pub src_h: u32,
     /// The part of the remote framebuffer that is visible. Smaller than the
-    /// whole thing only when panning a 1:1 view.
+    /// whole thing when panning a cropped 1:1 or percentage-scaled view.
     pub src: Rect,
     /// Size of the drawn image, in terminal pixels.
     pub dst_w: u32,
@@ -121,7 +121,8 @@ impl Layout {
     /// Work out the layout for a source of `src_w` x `src_h`.
     ///
     /// `pan` is the top-left of the visible window in source pixels, and is
-    /// clamped to whatever actually fits; it only matters in 1:1 modes.
+    /// clamped to whatever actually fits; it matters whenever the visible
+    /// source window is cropped (1:1 or fixed-percentage modes).
     pub fn compute(
         metrics: &Metrics,
         mode: ScaleMode,
@@ -144,6 +145,17 @@ impl Layout {
             let x = pan.0.min(src_w - vis_w);
             let y = pan.1.min(src_h - vis_h);
             (Rect::new(x, y, vis_w, vis_h), vis_w, vis_h, 1.0)
+        } else if let ScaleMode::Percent(pct) = mode {
+            let scale = f64::from(pct) / 100.0;
+            let max_vis_w = ((f64::from(area_w) / scale).floor() as u32).max(1);
+            let max_vis_h = ((f64::from(area_h) / scale).floor() as u32).max(1);
+            let vis_w = src_w.min(max_vis_w);
+            let vis_h = src_h.min(max_vis_h);
+            let x = pan.0.min(src_w - vis_w);
+            let y = pan.1.min(src_h - vis_h);
+            let dst_w = ((f64::from(vis_w) * scale).round() as u32).clamp(1, area_w);
+            let dst_h = ((f64::from(vis_h) * scale).round() as u32).clamp(1, area_h);
+            (Rect::new(x, y, vis_w, vis_h), dst_w, dst_h, scale)
         } else {
             let fit =
                 (f64::from(area_w) / f64::from(src_w)).min(f64::from(area_h) / f64::from(src_h));
@@ -221,14 +233,17 @@ impl Layout {
         let rel_x = visible.x - self.src.x;
         let rel_y = visible.y - self.src.y;
 
-        let x0 = (f64::from(rel_x) * self.scale).floor() as u32;
-        let y0 = (f64::from(rel_y) * self.scale).floor() as u32;
-        let x1 = (f64::from(rel_x + visible.w) * self.scale).ceil() as u32;
-        let y1 = (f64::from(rel_y + visible.h) * self.scale).ceil() as u32;
+        let scale_x = f64::from(self.dst_w) / f64::from(self.src.w);
+        let scale_y = f64::from(self.dst_h) / f64::from(self.src.h);
+        let x0 = (f64::from(rel_x) * scale_x).floor() as u32;
+        let y0 = (f64::from(rel_y) * scale_y).floor() as u32;
+        let x1 = (f64::from(rel_x + visible.w) * scale_x).ceil() as u32;
+        let y1 = (f64::from(rel_y + visible.h) * scale_y).ceil() as u32;
 
         let dst = Rect::new(x0, y0, x1.saturating_sub(x0), y1.saturating_sub(y0));
         let padded = if self.needs_scaling() {
-            dst.expand(self.filter().dst_padding())
+            let pad = (f64::from(self.filter().dst_padding()) * self.scale.max(1.0)).ceil() as u32;
+            dst.expand(pad)
         } else {
             dst
         };
@@ -261,8 +276,10 @@ impl Layout {
         if dx >= self.dst_w || dy >= self.dst_h {
             return None;
         }
-        let sx = self.src.x + (f64::from(dx) / self.scale) as u32;
-        let sy = self.src.y + (f64::from(dy) / self.scale) as u32;
+        let sx =
+            self.src.x + (f64::from(dx) * f64::from(self.src.w) / f64::from(self.dst_w)) as u32;
+        let sy =
+            self.src.y + (f64::from(dy) * f64::from(self.src.h) / f64::from(self.dst_h)) as u32;
         Some((
             sx.min(self.src.right().saturating_sub(1)) as u16,
             sy.min(self.src.bottom().saturating_sub(1)) as u16,
@@ -419,12 +436,12 @@ struct Content {
     dst: Rect,
     /// Where the visible part of the source starts. Panning moves this and nothing else.
     from: (u32, u32),
-    /// Destination pixels per source pixel, which is what says *which* source pixels reach
-    /// a given destination rectangle. Exactly `1.0` in the 1:1 modes however large the
-    /// window is -- which is why a window that grows keeps its interior tiles -- and a
-    /// different number every time a `fit` window is resized, which is why that one does
-    /// not.
-    scale: f64,
+    /// Source pixels per destination pixel along each axis, which is what says *which*
+    /// source pixels reach a given destination rectangle. Exactly `(1.0, 1.0)` in the
+    /// 1:1 modes however large the window is -- which is why a window that grows keeps
+    /// its interior tiles -- and tracks the exact achieved ratio under scaling, so
+    /// rounding differences along an axis never leave a seam.
+    per: (f64, f64),
     /// Which resampling produced it, if any. Two modes can land on the same scale and
     /// filter it differently.
     filter: Option<Filter>,
@@ -604,10 +621,18 @@ impl Renderer {
     /// many destination pixels a source pixel becomes -- which decides the same thing
     /// exactly.
     fn want(&self, tx: u16, ty: u16) -> Content {
+        let per = if self.layout.needs_scaling() {
+            (
+                f64::from(self.layout.src.w) / f64::from(self.layout.dst_w),
+                f64::from(self.layout.src.h) / f64::from(self.layout.dst_h),
+            )
+        } else {
+            (1.0, 1.0)
+        };
         Content {
             dst: self.grid.tile_rect(tx, ty),
             from: (self.layout.src.x, self.layout.src.y),
-            scale: self.layout.scale,
+            per,
             filter: self.layout.needs_scaling().then(|| self.layout.filter()),
             generation: self.tiles[usize::from(ty) * usize::from(self.grid.nx) + usize::from(tx)]
                 .touched,
@@ -897,14 +922,15 @@ impl Renderer {
                 // The source rectangle this region came from, in fractional pixels: the
                 // ratio is the one the layout actually achieved rather than its rounded
                 // scale, or the region would land a fraction of a pixel off the rest.
+                // Clamped to the framebuffer so floating-point rounding at a panned edge
+                // cannot cross the boundary.
                 let per_x = f64::from(self.layout.src.w) / f64::from(self.layout.dst_w);
                 let per_y = f64::from(self.layout.src.h) / f64::from(self.layout.dst_h);
-                let crop = (
-                    f64::from(self.layout.src.x) + f64::from(region.x) * per_x,
-                    f64::from(self.layout.src.y) + f64::from(region.y) * per_y,
-                    f64::from(region.w) * per_x,
-                    f64::from(region.h) * per_y,
-                );
+                let crop_x = f64::from(self.layout.src.x) + f64::from(region.x) * per_x;
+                let crop_y = f64::from(self.layout.src.y) + f64::from(region.y) * per_y;
+                let crop_w = (f64::from(region.w) * per_x).min(f64::from(fb.width()) - crop_x);
+                let crop_h = (f64::from(region.h) * per_y).min(f64::from(fb.height()) - crop_y);
+                let crop = (crop_x, crop_y, crop_w, crop_h);
                 if let Err(err) =
                     self.scaler
                         .resize_region(fb, crop, &mut self.scaled, region, filter)
@@ -1115,6 +1141,12 @@ mod tests {
                 ScaleMode::Fit,
                 ScaleMode::Integer,
                 ScaleMode::OneToOne,
+                ScaleMode::Percent(80),
+                ScaleMode::Percent(100),
+                ScaleMode::Percent(110),
+                ScaleMode::Percent(125),
+                ScaleMode::Percent(200),
+                ScaleMode::Percent(400),
             ] {
                 let l = Layout::compute(&m, mode, w, h, (0, 0));
                 let (area_w, area_h) = m.image_area();
@@ -1803,5 +1835,59 @@ mod tests {
         assert_eq!(Rect::new(0, 0, 2, 2).expand(3), Rect::new(0, 0, 5, 5));
         assert_eq!(Rect::new(5, 5, 2, 2).expand(3), Rect::new(2, 2, 8, 8));
         assert!(Rect::new(0, 0, 0, 5).is_empty());
+    }
+
+    #[test]
+    fn percent_mode_fills_window_without_cropping_a_matched_remote() {
+        let m = ghostty();
+        // Server resized to 1600/1.25 x 833/1.25 rounded down to even: 1280x666.
+        let l = Layout::compute(&m, ScaleMode::Percent(125), 1280, 666, (0, 0));
+        assert!(!l.is_cropped());
+        assert!(l.needs_scaling());
+        assert_eq!(l.src, Rect::new(0, 0, 1280, 666));
+        assert_eq!((l.dst_w, l.dst_h), (1600, 833));
+        assert_eq!(l.filter(), Filter::Lanczos3);
+        assert_eq!(l.pan_limits(), (0, 0));
+
+        // 200% uses crisp Nearest pixel doubling.
+        let two_x = Layout::compute(&m, ScaleMode::Percent(200), 800, 416, (0, 0));
+        assert!(!two_x.is_cropped());
+        assert_eq!((two_x.dst_w, two_x.dst_h), (1600, 832));
+        assert_eq!(two_x.filter(), Filter::Nearest);
+
+        // 100% stays pixel-exact with zero resampling.
+        let one_x = Layout::compute(&m, ScaleMode::Percent(100), 1600, 833, (0, 0));
+        assert!(one_x.is_pixel_exact());
+        assert!(!one_x.is_cropped());
+    }
+
+    #[test]
+    fn percent_mode_crops_pans_and_composes_panned_edges_safely() {
+        let m = ghostty();
+        // Fixed 1920x1080 remote at 125% overflows 1600x833, so it crops and pans.
+        let l = Layout::compute(&m, ScaleMode::Percent(125), 1920, 1080, (9999, 9999));
+        assert!(l.is_cropped());
+        assert_eq!(l.src.w, 1280);
+        assert_eq!(l.src.h, 666);
+        assert_eq!(l.src.x, 1920 - 1280);
+        assert_eq!(l.src.y, 1080 - 666);
+        assert_eq!((l.dst_w, l.dst_h), (1600, 833));
+        assert_eq!(l.terminal_px_to_src(0, 0), Some((640, 414)));
+        assert_eq!(l.terminal_px_to_src(1599, 832), Some((1919, 1079)));
+
+        // Composing a partial update at the bottom-right corner of a maximally panned
+        // fractional-scale view must not fail with an out-of-bounds crop box.
+        let mut r = Renderer::new(l, true, Transfer::Direct);
+        let mut fb = Framebuffer::new(1920, 1080);
+        fb.fill(fb.rect(), [40, 80, 120]);
+        let mut out = Vec::new();
+        let full = r.compose(&fb, &mut out);
+        assert_eq!(full.tiles, r.tile_count());
+        r.commit();
+
+        out.clear();
+        r.mark(Rect::new(1910, 1070, 10, 10));
+        let partial = r.compose(&fb, &mut out);
+        assert!(partial.tiles > 0);
     }
 }

@@ -11,7 +11,7 @@ use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
 use ratatui::widgets::Widget;
 
-use super::theme::{Palette, Theme, colour};
+use super::theme::{ColorScheme, Palette, Theme, colour};
 use crate::cli::{MenuKey, ScaleMode};
 use crate::term::Metrics;
 use crate::term::input::Command;
@@ -24,8 +24,14 @@ const PAD_Y: u16 = 1;
 /// Least space between a label and the shortcut sitting against the right edge.
 const GAP: u16 = 6;
 
-/// Space between two options of a choice row.
-const CHOICE_GAP: u16 = 2;
+/// Column where options start on a labeled choice row (`Mode`, `Zoom`, `Theme`,
+/// `Cursor`), so every choice row aligns cleanly to the same left edge.
+const CHOICE_LABEL_COL: u16 = 8;
+
+/// Space between two options of a choice row. Each option already carries a
+/// leading and trailing space (or bracket), so zero gap still leaves two spaces
+/// between unselected labels and one beside the active brackets.
+const CHOICE_GAP: u16 = 0;
 
 /// One line of the menu.
 enum Entry {
@@ -42,9 +48,10 @@ enum Entry {
         keys: &'static str,
         command: Command,
     },
-    /// A row of alternatives, exactly one of which is in force. Which one that is
+    /// A row of alternatives, at most one of which is in force. Which one that is
     /// arrives at draw time; the row itself only knows what is on offer.
     Choice {
+        label: &'static str,
         options: Vec<Option_>,
         keys: &'static str,
     },
@@ -76,6 +83,7 @@ impl Option_ {
         match self.command {
             Command::Mode(mode) => state.mode == mode,
             Command::Theme(theme) => state.theme == theme,
+            Command::RemoteCursor(remote) => state.remote_cursor == remote,
             _ => false,
         }
     }
@@ -83,12 +91,29 @@ impl Option_ {
 
 /// What the menu has to show as being in force.
 ///
-/// Passed in at draw time rather than remembered: the session owns both of these, and
+/// Passed in at draw time rather than remembered: the session owns all of these, and
 /// a second copy here could only ever drift from the first.
 #[derive(Debug, Clone, Copy)]
 pub struct State {
     pub mode: ScaleMode,
     pub theme: Theme,
+    pub detected_scheme: Option<ColorScheme>,
+    pub remote_cursor: bool,
+}
+
+impl State {
+    pub fn palette(self) -> &'static Palette {
+        self.theme.palette(self.detected_scheme)
+    }
+}
+
+/// Column offset where a choice row's options begin.
+fn choice_prefix(label: &str) -> u16 {
+    if label.is_empty() {
+        0
+    } else {
+        CHOICE_LABEL_COL.max(cells(label) + 1)
+    }
 }
 
 /// Every option with the columns it covers, relative to the left of the row.
@@ -96,9 +121,9 @@ pub struct State {
 /// The gap after an option belongs to it, so there is no dead strip between two
 /// targets; the last one ends where its text does, because everything past it is
 /// the shortcut's.
-fn option_spans(options: &[Option_]) -> Vec<(&Option_, u16, u16)> {
+fn option_spans<'a>(label: &str, options: &'a [Option_]) -> Vec<(&'a Option_, u16, u16)> {
     let mut out = Vec::with_capacity(options.len());
-    let mut x = 0;
+    let mut x = choice_prefix(label);
     for (i, option) in options.iter().enumerate() {
         let last = i + 1 == options.len();
         let end = x + option.width() + if last { 0 } else { CHOICE_GAP };
@@ -117,11 +142,11 @@ fn close_span(close: &str, width: u16) -> (u16, u16) {
     (width.saturating_sub(cells(close)), width)
 }
 
-/// Columns the options of a choice row occupy together.
-fn choice_width(options: &[Option_]) -> u16 {
-    match option_spans(options).last() {
+/// Columns a choice row's label and options occupy together.
+fn choice_width(label: &str, options: &[Option_]) -> u16 {
+    match option_spans(label, options).last() {
         Some((option, start, _)) => start + option.width(),
-        None => 0,
+        None => cells(label),
     }
 }
 
@@ -136,8 +161,12 @@ impl Entry {
                 (width, width)
             }
             Entry::Item { label, keys, .. } => (cells(label), cells(label) + GAP + cells(keys)),
-            Entry::Choice { options, keys } => {
-                let width = choice_width(options);
+            Entry::Choice {
+                label,
+                options,
+                keys,
+            } => {
+                let width = choice_width(label, options);
                 (width, width + GAP + cells(keys))
             }
         }
@@ -154,7 +183,7 @@ impl Entry {
     fn command_at(&self, offset: i32, width: u16) -> Option<Command> {
         match self {
             Entry::Item { command, .. } => Some(*command),
-            Entry::Choice { options, .. } => option_spans(options)
+            Entry::Choice { label, options, .. } => option_spans(label, options)
                 .into_iter()
                 .find(|(_, start, end)| offset >= i32::from(*start) && offset < i32::from(*end))
                 .map(|(option, ..)| option.command),
@@ -232,10 +261,11 @@ impl Menu {
             item("Pan down", "down", Command::Pan(0, 1)),
             Entry::Blank,
             Entry::Section("Scaling"),
-            // One row rather than four commands: the key steps through the modes
-            // because a single binding cannot name one, but a click can, so the
-            // options are offered side by side with the one in force marked.
+            // Modes on one row, percentage zoom presets on the next, aligned on the
+            // same column as Theme below: a click names any option directly, `m` cycles
+            // the modes, and `-`/`+` steps zoom.
             Entry::Choice {
+                label: "Mode",
                 options: vec![
                     Option_ {
                         name: "Native",
@@ -256,12 +286,45 @@ impl Menu {
                 ],
                 keys: "m",
             },
-            Entry::Blank,
-            Entry::Section("Theme"),
-            // No keys: two of anything is a choice rather than a cycle, and a click
-            // names one where a single binding could only alternate.
             Entry::Choice {
+                label: "Zoom",
                 options: vec![
+                    Option_ {
+                        name: "80%",
+                        command: Command::Mode(ScaleMode::Percent(80)),
+                    },
+                    Option_ {
+                        name: "100%",
+                        command: Command::Mode(ScaleMode::Percent(100)),
+                    },
+                    Option_ {
+                        name: "110%",
+                        command: Command::Mode(ScaleMode::Percent(110)),
+                    },
+                    Option_ {
+                        name: "125%",
+                        command: Command::Mode(ScaleMode::Percent(125)),
+                    },
+                    Option_ {
+                        name: "150%",
+                        command: Command::Mode(ScaleMode::Percent(150)),
+                    },
+                    Option_ {
+                        name: "200%",
+                        command: Command::Mode(ScaleMode::Percent(200)),
+                    },
+                ],
+                keys: "-/+",
+            },
+            Entry::Blank,
+            Entry::Section("View"),
+            Entry::Choice {
+                label: "Theme",
+                options: vec![
+                    Option_ {
+                        name: "Auto",
+                        command: Command::Theme(Theme::Auto),
+                    },
                     Option_ {
                         name: "Dark",
                         command: Command::Theme(Theme::Dark),
@@ -273,8 +336,20 @@ impl Menu {
                 ],
                 keys: "",
             },
-            Entry::Blank,
-            Entry::Section("View"),
+            Entry::Choice {
+                label: "Cursor",
+                options: vec![
+                    Option_ {
+                        name: "Local",
+                        command: Command::RemoteCursor(false),
+                    },
+                    Option_ {
+                        name: "Remote",
+                        command: Command::RemoteCursor(true),
+                    },
+                ],
+                keys: "p",
+            },
             item("Toggle view-only", "v", Command::ToggleViewOnly),
             item("Toggle statistics", "c", Command::ToggleStats),
         ];
@@ -362,8 +437,8 @@ impl Menu {
             })
         };
         match self.entries.get(index)? {
-            Entry::Choice { options, .. } => {
-                let (option, start, _) = option_spans(options)
+            Entry::Choice { label, options, .. } => {
+                let (option, start, _) = option_spans(label, options)
                     .into_iter()
                     .find(|(option, ..)| option.command == command)?;
                 span(start, option.width())
@@ -464,7 +539,7 @@ struct MenuView<'a> {
 
 impl Widget for MenuView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
-        let ink = self.state.theme.palette();
+        let ink = self.state.palette();
         let inner = self.viewport.inner;
         let rows = self.viewport.first_row..self.menu.entries.len();
         buf.set_style(area, Style::new().bg(colour(ink.paper)).fg(colour(ink.ink)));
@@ -514,8 +589,16 @@ impl Widget for MenuView<'_> {
                     };
                     split(buf, row, label, keys, style, ink);
                 }
-                Entry::Choice { options, keys } => {
-                    for (option, start, _) in option_spans(options) {
+                Entry::Choice {
+                    label,
+                    options,
+                    keys,
+                } => {
+                    if !label.is_empty() {
+                        Line::from(Span::styled(*label, Style::new().fg(colour(ink.ink))))
+                            .render(row, buf);
+                    }
+                    for (option, start, _) in option_spans(label, options) {
                         if start >= row.width {
                             break;
                         }
@@ -547,7 +630,7 @@ impl Widget for MenuView<'_> {
                         };
                         Line::from(Span::styled(text, style)).render(at, buf);
                     }
-                    if !keys.is_empty() && choice_width(options) + cells(keys) < row.width {
+                    if !keys.is_empty() && choice_width(label, options) + cells(keys) < row.width {
                         Line::from(Span::styled(*keys, Style::new().fg(colour(ink.muted))))
                             .right_aligned()
                             .render(row, buf);
@@ -593,6 +676,8 @@ mod tests {
         State {
             mode: ScaleMode::Fit,
             theme: Theme::Dark,
+            detected_scheme: None,
+            remote_cursor: false,
         }
     }
 
@@ -701,10 +786,26 @@ mod tests {
                 ..
             }
         ));
+
+        let (pct_row, pct_choices) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("100%"))
+            .unwrap();
+        let pct_col = pct_choices
+            .find("200%")
+            .expect("shortcut covered the last percentage option");
+        assert!(matches!(
+            menu.hit(&m, area.x + pct_col as u16, area.y + pct_row as u16),
+            Hit::Item {
+                command: Command::Mode(ScaleMode::Percent(200)),
+                ..
+            }
+        ));
     }
 
     fn assert_menu_background(buf: &Buffer, area: Rect, hover: Option<Rect>, theme: Theme) {
-        let palette = theme.palette();
+        let palette = theme.palette(None);
         for pos in buf.area.positions() {
             let expected = if hover.is_some_and(|rect| rect.contains(pos)) {
                 colour(palette.hover)
@@ -965,7 +1066,7 @@ mod tests {
         let mut out = Vec::new();
         draw_menu(&menu, &mut out, &m, state());
         let text = String::from_utf8(out).unwrap();
-        let ink = state().theme.palette();
+        let ink = state().palette();
         assert!(
             !text.contains(&bg(ink.hover)),
             "nothing else is hovered, so nothing should carry the lift: {text:?}"
@@ -1075,10 +1176,10 @@ mod tests {
     /// The same for whichever row of options is asked for.
     fn options_of(menu: &Menu, m: &Metrics, index: usize) -> Vec<(Command, u16, u16)> {
         let left = menu.area(m).expect("the menu must fit").x + PAD_X;
-        let Some(Entry::Choice { options, .. }) = menu.entries.get(index) else {
+        let Some(Entry::Choice { label, options, .. }) = menu.entries.get(index) else {
             panic!("entry {index} is not a row of options");
         };
-        option_spans(options)
+        option_spans(label, options)
             .into_iter()
             .map(|(option, start, end)| (option.command, left + start, left + end))
             .collect()
@@ -1101,10 +1202,11 @@ mod tests {
             }
         }
 
-        // The padding to the left of the first option belongs to no option, and
-        // neither does the stretch on the right where the shortcut lives. A row of
+        // The padding and row label to the left of the first option belong to no option,
+        // and neither does the stretch on the right where the shortcut lives. A row of
         // choices is not a target all the way across the way a command's row is.
         assert_eq!(menu.hit(&m, left - 1, row), Hit::Inside, "the left padding");
+        assert_eq!(menu.hit(&m, left, row), Hit::Inside, "the row label");
         let last = options(&menu, &m).last().copied().unwrap();
         assert_eq!(
             menu.hit(&m, last.2, row),
@@ -1144,6 +1246,36 @@ mod tests {
                 "the key still cycles: {drawn:?}"
             );
         }
+
+        // Percentage scaling options live on the row right beneath the modes.
+        let pct_row = row + 1;
+        for (pct, name) in [
+            (80, "80%"),
+            (100, "100%"),
+            (110, "110%"),
+            (125, "125%"),
+            (150, "150%"),
+            (200, "200%"),
+        ] {
+            let mut out = Vec::new();
+            draw_menu(
+                &menu,
+                &mut out,
+                &m,
+                State {
+                    mode: ScaleMode::Percent(pct),
+                    ..state()
+                },
+            );
+            let lines = rendered(&out);
+            let drawn = &lines[usize::from(pct_row - menu.area(&m).unwrap().y)];
+            assert!(drawn.contains(&format!("[{name}]")), "{pct}%: {drawn:?}");
+            assert_eq!(drawn.matches('[').count(), 1, "{pct}%: {drawn:?}");
+            assert!(
+                drawn.split_whitespace().last() == Some("-/+"),
+                "the zoom shortcut sits on the right: {drawn:?}"
+            );
+        }
     }
 
     #[test]
@@ -1153,12 +1285,12 @@ mod tests {
         let index = menu
             .entries
             .iter()
-            .rposition(|e| matches!(e, Entry::Choice { .. }))
+            .position(|e| matches!(e, Entry::Choice { label: "Theme", .. }))
             .expect("no theme row");
         let area = menu.area(&m).unwrap();
         let row = area.y + PAD_Y + u16::try_from(index).unwrap();
 
-        // Two options, each its own target, and each naming the theme it would put on.
+        // Three options, each its own target, and each naming the theme it would put on.
         for (want, start, end) in options_of(&menu, &m, index) {
             for col in [start, end - 1] {
                 match menu.hit(&m, col, row) {
@@ -1170,18 +1302,27 @@ mod tests {
             }
         }
 
-        // The brackets follow whichever is in force, and the row is drawn in it too:
-        // choosing a theme shows you the theme.
-        for (theme, name) in [(Theme::Dark, "Dark"), (Theme::Light, "Light")] {
+        // The brackets follow whichever is in force, and Auto adopts the detected scheme.
+        for (theme, detected, name) in [
+            (Theme::Auto, Some(ColorScheme::Light), "Auto"),
+            (Theme::Auto, Some(ColorScheme::Dark), "Auto"),
+            (Theme::Dark, None, "Dark"),
+            (Theme::Light, None, "Light"),
+        ] {
+            let st = State {
+                theme,
+                detected_scheme: detected,
+                ..state()
+            };
             let mut out = Vec::new();
-            draw_menu(&menu, &mut out, &m, State { theme, ..state() });
+            draw_menu(&menu, &mut out, &m, st);
             let text = String::from_utf8(out).unwrap();
             let drawn = &rendered(text.as_bytes())[usize::from(row - area.y)];
             assert!(drawn.contains(&format!("[{name}]")), "{theme:?}: {drawn:?}");
             assert_eq!(drawn.matches('[').count(), 1, "{theme:?}: {drawn:?}");
             assert!(
-                text.contains(&bg(theme.palette().paper)),
-                "{theme:?}: the box is not in the theme it says is in force"
+                text.contains(&bg(st.palette().paper)),
+                "{theme:?} ({detected:?}): the box is not in the palette it resolved to"
             );
         }
     }
@@ -1231,5 +1372,56 @@ mod tests {
         // click would act on.
         menu.set_hover(menu.hit(&m, col, menu.area(&m).unwrap().y + PAD_Y));
         assert_eq!(menu.hover, None);
+    }
+
+    #[test]
+    fn the_cursor_row_selects_local_or_remote() {
+        let menu = Menu::new(MenuKey::F8);
+        let m = metrics(100, 40);
+        let index = menu
+            .entries
+            .iter()
+            .position(|e| {
+                matches!(
+                    e,
+                    Entry::Choice {
+                        label: "Cursor",
+                        ..
+                    }
+                )
+            })
+            .expect("no cursor row");
+        let area = menu.area(&m).unwrap();
+        let row = area.y + PAD_Y + u16::try_from(index).unwrap();
+
+        for (want, start, end) in options_of(&menu, &m, index) {
+            for col in [start, end - 1] {
+                assert_eq!(
+                    menu.hit(&m, col, row),
+                    Hit::Item {
+                        index,
+                        command: want
+                    }
+                );
+            }
+        }
+
+        for (remote_cursor, name) in [(false, "Local"), (true, "Remote")] {
+            let mut out = Vec::new();
+            draw_menu(
+                &menu,
+                &mut out,
+                &m,
+                State {
+                    remote_cursor,
+                    ..state()
+                },
+            );
+            let lines = rendered(&out);
+            let drawn = &lines[usize::from(row - area.y)];
+            assert!(drawn.contains(&format!("[{name}]")), "{drawn:?}");
+            assert_eq!(drawn.matches('[').count(), 1, "{drawn:?}");
+            assert!(drawn.split_whitespace().last() == Some("p"), "{drawn:?}");
+        }
     }
 }

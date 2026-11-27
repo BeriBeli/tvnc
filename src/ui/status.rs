@@ -117,12 +117,12 @@ pub fn render(
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::ui::theme::Theme;
+    use crate::ui::theme::ColorScheme;
     use crate::ui::theme::probe::{bg, fg};
 
     /// The palette the tests draw in, unless they are about the palettes themselves.
     fn ink() -> &'static Palette {
-        Theme::Dark.palette()
+        ColorScheme::Dark.palette()
     }
 
     fn metrics(cols: u16, rows: u16) -> Metrics {

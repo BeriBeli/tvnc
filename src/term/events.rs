@@ -15,6 +15,8 @@ use tokio::io::unix::AsyncFd;
 use tokio::signal::unix::{Signal, SignalKind, signal};
 use tokio::time::{Instant, sleep_until};
 
+use crate::ui::theme::ColorScheme;
+
 #[derive(Clone, Copy, Debug, Default, PartialEq, Eq)]
 pub struct KeyAlternates {
     pub shifted: Option<char>,
@@ -51,6 +53,7 @@ impl FrameQuery {
 pub enum Report {
     Input(Event, KeyAlternates),
     FramePresented,
+    ColorScheme(ColorScheme),
 }
 
 pub struct TerminalEvents {
@@ -213,6 +216,7 @@ fn starts_csi_or_apc(query: FrameQuery, byte: u8) -> bool {
 enum Reply {
     Incomplete,
     Presented,
+    ColorScheme(ColorScheme),
     Other,
 }
 
@@ -226,6 +230,11 @@ fn terminal_reply(query: FrameQuery, seq: &[u8]) -> Option<Reply> {
         let (&last, body) = csi.split_last()?;
         if !(0x40..=0x7e).contains(&last) {
             return Some(Reply::Incomplete);
+        }
+        if last == b'n'
+            && let Some(scheme) = super::caps::color_scheme_reply(body)
+        {
+            return Some(Reply::ColorScheme(scheme));
         }
         let da1 = last == b'c' && super::caps::da1_parameters(body).is_some();
         return Some(if da1 && query == FrameQuery::DeviceAttributes {
@@ -292,6 +301,7 @@ fn queue_reports(
         match terminal_reply(query, pending) {
             Some(Reply::Incomplete) => continue,
             Some(Reply::Presented) => ready.push_back(Report::FramePresented),
+            Some(Reply::ColorScheme(scheme)) => ready.push_back(Report::ColorScheme(scheme)),
             Some(Reply::Other) => {}
             None if query == FrameQuery::KittyGraphics && pending.starts_with(b"\x1b_") => {
                 finish_escape_key(query, pending, ready);
@@ -567,6 +577,25 @@ mod tests {
                 key('_', KeyModifiers::ALT),
                 key('G', KeyModifiers::SHIFT),
                 key('!', KeyModifiers::NONE)
+            ]
+        );
+    }
+
+    #[test]
+    fn mode_2031_color_scheme_updates_arrive_as_reports() {
+        let mut pending = Vec::new();
+        let mut ready = VecDeque::new();
+        queue_reports(
+            FrameQuery::DeviceAttributes,
+            &mut pending,
+            &mut ready,
+            b"\x1b[?997;2n\x1b[?997;1n",
+        );
+        assert_eq!(
+            ready,
+            [
+                Report::ColorScheme(ColorScheme::Light),
+                Report::ColorScheme(ColorScheme::Dark),
             ]
         );
     }

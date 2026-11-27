@@ -699,3 +699,78 @@ fn a_drag_is_still_coalesced_into_a_few_requests() {
     quit(&mut term);
     term.wait(Duration::from_secs(10));
 }
+
+#[test]
+fn percentage_scale_negotiates_scaled_remote_size_and_follows_resizes() {
+    // 200x50 cells of 8x17 -> 1600x833 image area.
+    // At 125%: floor(1600 / 1.25) = 1280, floor(833 / 1.25) = 666 (both even).
+    let (server, mut term) = start_with(Extensions::default(), (1024, 768), &["--scale", "125%"]);
+
+    let request = server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(
+                r,
+                Request::SetDesktopSize {
+                    width: 1280,
+                    height: 666,
+                    ..
+                }
+            )
+        })
+        .expect("client never asked the server for the 125%-scaled size");
+    assert!(matches!(request, Request::SetDesktopSize { .. }));
+
+    assert_reports_size(&term, "1280x666 -> 1600x833  125%", Duration::from_secs(10));
+    assert_drew(&term, Duration::from_secs(5));
+
+    // Resizing the terminal to 100x25 (800x408 image area) asks for 640x326.
+    term.resize(100, 25, 800, 425);
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| {
+                matches!(
+                    r,
+                    Request::SetDesktopSize {
+                        width: 640,
+                        height: 326,
+                        ..
+                    }
+                )
+            })
+            .is_some(),
+        "client did not renegotiate scaled size after terminal resize"
+    );
+    assert_reports_size(&term, "640x326 -> 800x408  125%", Duration::from_secs(10));
+
+    quit(&mut term);
+    assert!(term.wait(Duration::from_secs(10)).unwrap().success());
+}
+
+#[test]
+fn percentage_scale_falls_back_to_local_zoom_when_resize_is_refused() {
+    // Server refuses resize and stays at 1920x1080, which overflows 1600x833 at 125%.
+    let server = FakeServer::start(1920, 1080, Resize::Refuse);
+    let addr = server.addr.to_string();
+    let mut term = FakeTerm::spawn(
+        COLS,
+        ROWS,
+        PIXELS.0,
+        PIXELS.1,
+        &[&addr, "--fps", "15", "--scale", "125%"],
+    );
+    term.answer_probe(GHOSTTY_REPLIES);
+
+    assert!(
+        wait_for_text(
+            &term,
+            "1920x1080 -> 1600x833  125% cropped",
+            Duration::from_secs(10)
+        ),
+        "expected local 125% cropped zoom fallback: {}",
+        Screen::of(&term.output()).row(usize::from(ROWS) - 1)
+    );
+    assert_drew(&term, Duration::from_secs(5));
+
+    quit(&mut term);
+    assert!(term.wait(Duration::from_secs(10)).unwrap().success());
+}

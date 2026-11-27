@@ -611,7 +611,7 @@ fn the_cursor_shape_is_requested_and_drawn_locally() {
         cursor: true,
         ..Extensions::default()
     };
-    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit"]);
+    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit", "--remote-cursor"]);
     assert_drew(&term, Duration::from_secs(10));
 
     match server
@@ -709,4 +709,68 @@ fn view_only_leaves_the_cursor_to_the_server() {
 
     quit(&mut term);
     term.wait(Duration::from_secs(10));
+}
+
+#[test]
+fn local_cursor_is_the_default_and_avoids_drawing_a_second_cursor() {
+    // By default the client still asks the server for CursorPseudo (-239) so the server
+    // stops baking a lagging cursor into tiles, switches the terminal pointer to the OS
+    // arrow (OSC 22), and does not draw a duplicate Kitty RGBA cursor overlay until asked.
+    let ext = Extensions {
+        cursor: true,
+        ..Extensions::default()
+    };
+    let (server, mut term) = start_with(ext, (800, 600), &["--scale", "fit"]);
+    assert_drew(&term, Duration::from_secs(10));
+
+    match server
+        .wait_for(Duration::from_secs(10), |r| {
+            matches!(r, Request::SetEncodings(_))
+        })
+        .expect("no encodings negotiated")
+    {
+        Request::SetEncodings(encodings) => assert!(
+            encodings.contains(&-239),
+            "the cursor encoding must still be requested to hide the server cursor: {encodings:?}"
+        ),
+        other => panic!("unexpected {other:?}"),
+    }
+
+    assert!(
+        contains(&term.output(), b"\x1b]22;default\x1b\\"),
+        "expected OSC 22 arrow pointer on startup"
+    );
+
+    let bytes_before = term.output().len();
+    for x in (200..440).step_by(40) {
+        term.send(format!("\x1b[<35;{x};200M").as_bytes());
+        std::thread::sleep(Duration::from_millis(30));
+    }
+    std::thread::sleep(Duration::from_millis(300));
+    let out = term.output();
+    let since = &out[bytes_before.min(out.len())..];
+    assert!(
+        !contains(since, b"f=32,i="),
+        "default local cursor mode must not draw a duplicate RGBA cursor image: {}",
+        show(since)
+    );
+
+    // Toggling remote cursor on via the menu (`F8` -> `p`) draws the cached cursor shape.
+    let before_toggle = term.output().len();
+    term.send(F8);
+    assert!(wait_for_text(&term, "[Local]", Duration::from_secs(10)));
+    term.send(b"p");
+    assert!(wait_for_text(&term, "[Remote]", Duration::from_secs(10)));
+    assert!(
+        term.wait_for_after(before_toggle, b"f=32,i=", Duration::from_secs(10))
+            .is_some(),
+        "enabling remote cursor did not draw the remote cursor image"
+    );
+
+    term.send(b"q");
+    assert!(term.wait(Duration::from_secs(10)).unwrap().success());
+    assert!(
+        contains(&term.output(), b"\x1b]22;\x1b\\"),
+        "expected OSC 22 pointer reset on exit"
+    );
 }

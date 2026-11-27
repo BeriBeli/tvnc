@@ -16,10 +16,12 @@ half-blocks.
 `tvnc desk:1`, `tvnc 10.0.0.5::5900`. Display numbers, raw ports and IPv6 parse
 the way every other VNC client parses them.
 
-**The desktop fits your window, four ways.** `--scale native | fit | integer | 1:1`,
-switchable in the `F8` menu by clicking a mode or pressing `m` to cycle. Native asks the server to resize itself
-to the terminal so nothing is resampled; the other three cover servers that refuse.
-Arrows pan when the view is cropped.
+**The desktop fits your window, your way.** `--scale native | fit | integer | 1:1 | <N>%`
+(e.g. `80%`, `110%`, `125%`, `150%`, `200%`), switchable in the `F8` menu by clicking an option,
+pressing `m` to cycle modes, or pressing `-`/`+` to step zoom. Native asks the server to
+resize to the terminal so nothing is resampled; percentage scaling asks a resize-capable
+server for `window / scale` so text scales up without cropping, and falls back to local
+zoom-and-pan when the server refuses. Arrows pan when the view is cropped.
 
 **A shared clipboard, both directions, in UTF-8.** Copy on the remote desktop and paste
 locally; copy locally and paste there. Servers that support the `ExtendedClipboard`
@@ -135,8 +137,10 @@ the menu is visible and resumes it when the desktop returns.
 | `f` | full screen refresh |
 | `r` | renegotiate the remote size |
 | `m` | cycle the scaling mode: native / fit / integer / 1:1 |
+| `-` / `+` | step percentage scaling: 80% / 100% / 110% / 125% / 150% / 200% |
 | arrows | pan, when the view is cropped |
 | `v` | toggle view-only |
+| `p` | toggle cursor mode: local OS arrow (default, avoids double cursors) / remote cursor overlay |
 | `c` | toggle statistics: ours (fps, tiles, bytes per frame) and the server's (updates per second, delivery time, megapixels per update), plus RTT and dropped frames |
 
 Clipboard works in both directions: paste into the terminal and it reaches the

@@ -16,19 +16,55 @@ pub fn colour(rgb: Rgb) -> Color {
     Color::Rgb(rgb.0, rgb.1, rgb.2)
 }
 
-/// Which palette is in force.
+/// A concrete dark or light appearance.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum ColorScheme {
+    Dark,
+    Light,
+}
+
+impl ColorScheme {
+    pub fn palette(self) -> &'static Palette {
+        match self {
+            ColorScheme::Dark => &DARK,
+            ColorScheme::Light => &LIGHT,
+        }
+    }
+
+    /// Infer dark or light appearance from a terminal's background colour.
+    pub fn from_background(rgb: Rgb) -> Self {
+        let luma = 0.299 * f32::from(rgb.0) + 0.587 * f32::from(rgb.1) + 0.114 * f32::from(rgb.2);
+        if luma >= 128.0 {
+            ColorScheme::Light
+        } else {
+            ColorScheme::Dark
+        }
+    }
+}
+
+/// Which palette preference is in force.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
 pub enum Theme {
+    /// Follow the terminal's own dark/light appearance.
+    #[default]
+    Auto,
     Dark,
     Light,
 }
 
 impl Theme {
-    pub fn palette(self) -> &'static Palette {
+    /// Resolve to a concrete appearance, falling back to dark when the terminal
+    /// did not report one.
+    pub fn resolve(self, detected: Option<ColorScheme>) -> ColorScheme {
         match self {
-            Theme::Dark => &DARK,
-            Theme::Light => &LIGHT,
+            Theme::Auto => detected.unwrap_or(ColorScheme::Dark),
+            Theme::Dark => ColorScheme::Dark,
+            Theme::Light => ColorScheme::Light,
         }
+    }
+
+    pub fn palette(self, detected: Option<ColorScheme>) -> &'static Palette {
+        self.resolve(detected).palette()
     }
 }
 
@@ -136,11 +172,11 @@ mod tests {
     fn the_menu_and_the_bar_share_a_surface() {
         // The two are one piece of chrome to look at, so the box is the bar's colour
         // rather than one of its own.
-        for theme in [Theme::Dark, Theme::Light] {
-            let p = theme.palette();
+        for scheme in [ColorScheme::Dark, ColorScheme::Light] {
+            let p = scheme.palette();
             assert_eq!(
                 p.paper, p.bar,
-                "{theme:?}: the menu is not the bar's colour"
+                "{scheme:?}: the menu is not the bar's colour"
             );
         }
     }
@@ -150,18 +186,18 @@ mod tests {
         // The menu's title and the popup both carry one, and one definition serves both,
         // so this is the whole of what either of them does to it: grey to the accent, with
         // no ground behind it and no rule under it.
-        for theme in [Theme::Dark, Theme::Light] {
-            let p = theme.palette();
+        for scheme in [ColorScheme::Dark, ColorScheme::Light] {
+            let p = scheme.palette();
             let quiet = p.close_button(false);
-            assert_eq!(quiet.fg, Some(colour(p.muted)), "{theme:?}");
+            assert_eq!(quiet.fg, Some(colour(p.muted)), "{scheme:?}");
 
             let lit = p.close_button(true);
-            assert_eq!(lit.fg, Some(colour(p.accent)), "{theme:?}");
+            assert_eq!(lit.fg, Some(colour(p.accent)), "{scheme:?}");
             for state in [quiet, lit] {
-                assert_eq!(state.bg, None, "{theme:?}: the button has no ground");
+                assert_eq!(state.bg, None, "{scheme:?}: the button has no ground");
                 assert!(
                     state.add_modifier.is_empty(),
-                    "{theme:?}: the colour is the whole of it"
+                    "{scheme:?}: the colour is the whole of it"
                 );
             }
         }
@@ -173,7 +209,7 @@ mod tests {
         // half-edited: dark ink on dark paper, or the reverse.
         let luma =
             |(r, g, b): Rgb| 0.299 * f32::from(r) + 0.587 * f32::from(g) + 0.114 * f32::from(b);
-        let dark = Theme::Dark.palette();
+        let dark = ColorScheme::Dark.palette();
         assert!(
             luma(dark.paper) < 64.0,
             "the dark theme's paper is not dark"
@@ -185,7 +221,7 @@ mod tests {
             );
         }
 
-        let light = Theme::Light.palette();
+        let light = ColorScheme::Light.palette();
         assert!(
             luma(light.paper) > 192.0,
             "the light theme's paper is not light"
@@ -202,5 +238,34 @@ mod tests {
                 "{ink:?} is lost on the light bar"
             );
         }
+    }
+
+    #[test]
+    fn auto_theme_follows_detected_scheme_and_defaults_to_dark() {
+        assert_eq!(Theme::Auto.resolve(None), ColorScheme::Dark);
+        assert_eq!(
+            Theme::Auto.resolve(Some(ColorScheme::Dark)),
+            ColorScheme::Dark
+        );
+        assert_eq!(
+            Theme::Auto.resolve(Some(ColorScheme::Light)),
+            ColorScheme::Light
+        );
+        assert_eq!(
+            Theme::Dark.resolve(Some(ColorScheme::Light)),
+            ColorScheme::Dark
+        );
+        assert_eq!(
+            Theme::Light.resolve(Some(ColorScheme::Dark)),
+            ColorScheme::Light
+        );
+        assert_eq!(
+            ColorScheme::from_background((0x1e, 0x1e, 0x2e)),
+            ColorScheme::Dark
+        );
+        assert_eq!(
+            ColorScheme::from_background((0xfa, 0xfa, 0xfa)),
+            ColorScheme::Light
+        );
     }
 }

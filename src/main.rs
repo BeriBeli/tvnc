@@ -186,6 +186,14 @@ fn print_caps(caps: &caps::Caps, metrics: &Metrics, ioctl_px: Option<(u32, u32)>
             "   [multi-tile frames may tear]"
         }
     );
+    println!(
+        "  colour scheme        {}",
+        match caps.color_scheme {
+            Some(ui::theme::ColorScheme::Dark) => "dark",
+            Some(ui::theme::ColorScheme::Light) => "light",
+            None => "(unknown)",
+        }
+    );
     println!();
     println!("geometry");
     println!(

@@ -1,8 +1,17 @@
 //! Command line surface.
 
+use std::fmt;
 use std::path::PathBuf;
+use std::str::FromStr;
 
 use clap::{Parser, ValueEnum};
+
+/// Bounds for an explicit percentage scale (`--scale 125%`).
+pub const MIN_SCALE_PERCENT: u16 = 25;
+pub const MAX_SCALE_PERCENT: u16 = 400;
+
+/// Percentage scaling presets offered in the command menu and stepped by `-`/`+`.
+pub const SCALE_PRESETS: &[u16] = &[80, 100, 110, 125, 150, 200];
 
 /// A pixel-perfect VNC client for terminals that speak the Kitty graphics protocol.
 #[derive(Debug, Parser)]
@@ -21,8 +30,9 @@ pub struct Args {
     #[arg(long, value_name = "PATH")]
     pub passwd: Option<PathBuf>,
 
-    /// How remote pixels map onto terminal pixels.
-    #[arg(long, value_enum, default_value_t = ScaleMode::Native)]
+    /// How remote pixels map onto terminal pixels: `native`, `fit`, `integer`,
+    /// `1:1`, or a percentage such as `80%`, `110%`, `125%`, `150%`, `200%`.
+    #[arg(long, value_name = "MODE|PERCENT%", default_value_t = ScaleMode::Native)]
     pub scale: ScaleMode,
 
     /// How image data reaches the terminal.
@@ -52,6 +62,14 @@ pub struct Args {
     /// Never send input to the server.
     #[arg(long)]
     pub view_only: bool,
+
+    /// Draw the remote server's cursor bitmap on top of the desktop.
+    ///
+    /// Off by default to avoid double cursors: the viewer still negotiates the
+    /// `Cursor` pseudo-encoding so the server does not paint a lagging cursor
+    /// into the framebuffer, and sets the terminal pointer to the OS arrow.
+    #[arg(long)]
+    pub remote_cursor: bool,
 
     /// Do not synchronise clipboards in either direction.
     #[arg(long)]
@@ -100,7 +118,7 @@ pub enum MenuKey {
 }
 
 /// How the remote framebuffer is mapped onto the terminal's pixel area.
-#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum ScaleMode {
     /// Ask the server to resize its desktop to exactly the terminal's pixel
     /// area, so one remote pixel is one terminal pixel. Falls back to `fit` if
@@ -111,8 +129,14 @@ pub enum ScaleMode {
     /// Largest whole-number scale factor that fits. Never interpolates.
     Integer,
     /// No scaling: show a 1:1 window onto the remote desktop and pan it.
-    #[value(name = "1:1")]
     OneToOne,
+    /// Scale by a fixed percentage (e.g. `80%`, `100%`, `110%`, `125%`, `150%`, `200%`).
+    ///
+    /// Like HiDPI display scaling: asks a resize-capable server for
+    /// `window / scale` so the scaled desktop fills the window without
+    /// cropping. If the server cannot or refuses to resize, zooms the existing
+    /// desktop at that percentage and pans when it overflows the window.
+    Percent(u16),
 }
 
 impl ScaleMode {
@@ -122,8 +146,86 @@ impl ScaleMode {
             ScaleMode::Native => ScaleMode::Fit,
             ScaleMode::Fit => ScaleMode::Integer,
             ScaleMode::Integer => ScaleMode::OneToOne,
-            ScaleMode::OneToOne => ScaleMode::Native,
+            ScaleMode::OneToOne | ScaleMode::Percent(_) => ScaleMode::Native,
         }
+    }
+
+    /// Whether this mode asks the server to resize its desktop to fit the terminal.
+    pub fn negotiates_size(self) -> bool {
+        matches!(self, ScaleMode::Native | ScaleMode::Percent(_))
+    }
+
+    /// Step up (`delta > 0`) or down (`delta < 0`) through [`SCALE_PRESETS`].
+    pub fn step_percent(self, delta: i8) -> Self {
+        let current = match self {
+            ScaleMode::Percent(pct) => pct,
+            _ => 100,
+        };
+        let next = if delta > 0 {
+            SCALE_PRESETS
+                .iter()
+                .copied()
+                .find(|&p| p > current)
+                .unwrap_or(current.max(*SCALE_PRESETS.last().unwrap()))
+        } else if delta < 0 {
+            SCALE_PRESETS
+                .iter()
+                .rev()
+                .copied()
+                .find(|&p| p < current)
+                .unwrap_or(current.min(*SCALE_PRESETS.first().unwrap()))
+        } else {
+            current
+        };
+        ScaleMode::Percent(next)
+    }
+}
+
+impl fmt::Display for ScaleMode {
+    fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
+        match self {
+            ScaleMode::Native => f.write_str("native"),
+            ScaleMode::Fit => f.write_str("fit"),
+            ScaleMode::Integer => f.write_str("integer"),
+            ScaleMode::OneToOne => f.write_str("1:1"),
+            ScaleMode::Percent(pct) => write!(f, "{pct}%"),
+        }
+    }
+}
+
+impl FromStr for ScaleMode {
+    type Err = String;
+
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        let trimmed = s.trim();
+        if trimmed.eq_ignore_ascii_case("native") {
+            return Ok(ScaleMode::Native);
+        }
+        if trimmed.eq_ignore_ascii_case("fit") {
+            return Ok(ScaleMode::Fit);
+        }
+        if trimmed.eq_ignore_ascii_case("integer") {
+            return Ok(ScaleMode::Integer);
+        }
+        if trimmed == "1:1" {
+            return Ok(ScaleMode::OneToOne);
+        }
+        if let Some(num) = trimmed.strip_suffix('%') {
+            let pct: u16 = num.parse().map_err(|_| {
+                format!(
+                    "invalid scale `{s}`; expected native, fit, integer, 1:1, or a percentage like 125%"
+                )
+            })?;
+            if !(MIN_SCALE_PERCENT..=MAX_SCALE_PERCENT).contains(&pct) {
+                return Err(format!(
+                    "scale percentage `{s}` out of range; expected {MIN_SCALE_PERCENT}%..={MAX_SCALE_PERCENT}%"
+                ));
+            }
+            return Ok(ScaleMode::Percent(pct));
+        }
+        Err(format!(
+            "invalid scale `{s}`; expected native, fit, integer, 1:1, or a percentage like 125%"
+        ))
     }
 }
 
@@ -348,5 +450,80 @@ mod tests {
             ]
         );
         assert_eq!(mode.next(), ScaleMode::Native);
+        assert_eq!(ScaleMode::Percent(125).next(), ScaleMode::Native);
+    }
+
+    #[test]
+    fn scale_mode_parses_names_and_percentages() {
+        for (raw, want) in [
+            ("native", ScaleMode::Native),
+            ("Native", ScaleMode::Native),
+            ("fit", ScaleMode::Fit),
+            ("integer", ScaleMode::Integer),
+            ("1:1", ScaleMode::OneToOne),
+            ("80%", ScaleMode::Percent(80)),
+            ("100%", ScaleMode::Percent(100)),
+            ("110%", ScaleMode::Percent(110)),
+            ("115%", ScaleMode::Percent(115)),
+            ("125%", ScaleMode::Percent(125)),
+            ("150%", ScaleMode::Percent(150)),
+            ("200%", ScaleMode::Percent(200)),
+            ("25%", ScaleMode::Percent(25)),
+            ("400%", ScaleMode::Percent(400)),
+        ] {
+            let parsed: ScaleMode = raw.parse().unwrap_or_else(|e| panic!("{raw}: {e}"));
+            assert_eq!(parsed, want);
+            assert_eq!(parsed.to_string().parse::<ScaleMode>().unwrap(), want);
+        }
+
+        for bad in ["", "0%", "10%", "401%", "125", "abc%", "-10%", "zoom"] {
+            assert!(bad.parse::<ScaleMode>().is_err(), "{bad:?} should fail");
+        }
+    }
+
+    #[test]
+    fn step_percent_walks_the_presets_without_reversing_past_bounds() {
+        assert_eq!(ScaleMode::Native.step_percent(1), ScaleMode::Percent(110));
+        assert_eq!(ScaleMode::Native.step_percent(-1), ScaleMode::Percent(80));
+        assert_eq!(
+            ScaleMode::Percent(80).step_percent(-1),
+            ScaleMode::Percent(80)
+        );
+        assert_eq!(
+            ScaleMode::Percent(80).step_percent(1),
+            ScaleMode::Percent(100)
+        );
+        assert_eq!(
+            ScaleMode::Percent(110).step_percent(1),
+            ScaleMode::Percent(125)
+        );
+        assert_eq!(
+            ScaleMode::Percent(115).step_percent(1),
+            ScaleMode::Percent(125)
+        );
+        assert_eq!(
+            ScaleMode::Percent(115).step_percent(-1),
+            ScaleMode::Percent(110)
+        );
+        assert_eq!(
+            ScaleMode::Percent(200).step_percent(1),
+            ScaleMode::Percent(200)
+        );
+        assert_eq!(
+            ScaleMode::Percent(300).step_percent(1),
+            ScaleMode::Percent(300)
+        );
+        assert_eq!(
+            ScaleMode::Percent(300).step_percent(-1),
+            ScaleMode::Percent(200)
+        );
+        assert_eq!(
+            ScaleMode::Percent(50).step_percent(1),
+            ScaleMode::Percent(80)
+        );
+        assert_eq!(
+            ScaleMode::Percent(50).step_percent(-1),
+            ScaleMode::Percent(50)
+        );
     }
 }

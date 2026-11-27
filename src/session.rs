@@ -32,7 +32,7 @@ use crate::term::{Metrics, TerminalGuard, kitty};
 use crate::ui::chrome::Chrome;
 use crate::ui::menu::{self, Hit, Menu};
 use crate::ui::status;
-use crate::ui::theme::Theme;
+use crate::ui::theme::{ColorScheme, Palette, Theme};
 use crate::ui::toast::Toast;
 
 /// A server that has gone quiet for this long gets its update request repeated.
@@ -386,9 +386,11 @@ struct Session<'a, B: Backend> {
     /// answer takes a negotiation, and the pessimistic assumption is the safe one to
     /// start on.
     clipboard_lossy: bool,
-    /// Which palette the chrome wears. Dark to start, the bar having been that colour
-    /// before there was a choice.
+    /// Which palette preference the chrome wears. Auto follows the terminal's
+    /// dark/light appearance and updates live on mode 2031 notifications.
     theme: Theme,
+    /// The terminal's last reported dark/light appearance, if any.
+    detected_scheme: Option<ColorScheme>,
     /// The cells the client owns, diffed frame to frame so taking chrome off the screen is
     /// the same operation as putting it on.
     chrome: Chrome,
@@ -402,6 +404,12 @@ struct Session<'a, B: Backend> {
     /// frame composes, which is what a resize looked like; carried into that frame's
     /// synchronised block, the old picture stands until the new one replaces it.
     pending_cleanup: Vec<u8>,
+    /// Whether to overlay the remote server's cursor bitmap on top of the desktop.
+    /// Off by default so the OS pointer is the only cursor on screen.
+    show_remote_cursor: bool,
+    /// Last cursor shape sent by the server, kept so toggling the overlay on shows it
+    /// immediately without waiting for the server to send a new shape.
+    remote_cursor: Option<crate::render::Cursor>,
     show_stats: bool,
     /// The notification popup in the top-right corner, and the note it is showing.
     toast: Toast,
@@ -495,12 +503,15 @@ impl<'a, B: Backend> Session<'a, B> {
             view_only,
             no_clipboard: args.no_clipboard,
             clipboard_lossy: true,
-            theme: Theme::Dark,
+            theme: Theme::Auto,
+            detected_scheme: caps.color_scheme,
             chrome: Chrome::new(),
             menu: Menu::new(args.menu_key),
             show_menu: false,
             menu_dirty: false,
             pending_cleanup: Vec::new(),
+            show_remote_cursor: args.remote_cursor,
+            remote_cursor: None,
             show_stats: false,
             toast: Toast::default(),
             fps: FpsMeter::new(),
@@ -546,6 +557,7 @@ impl<'a, B: Backend> Session<'a, B> {
                     match report.context("failed to read terminal input")? {
                         Report::Input(event, alternates) => self.on_terminal(event, alternates).await?,
                         Report::FramePresented => self.presentation.acknowledge(),
+                        Report::ColorScheme(scheme) => self.on_color_scheme(scheme),
                     }
                 }
                 _ = ticker.tick() => self.on_tick().await?,
@@ -708,7 +720,10 @@ impl<'a, B: Backend> Session<'a, B> {
                     cursor.hot_x,
                     cursor.hot_y
                 );
-                self.renderer.set_cursor(Some(cursor));
+                self.remote_cursor = Some(cursor.clone());
+                if self.show_remote_cursor {
+                    self.renderer.set_cursor(Some(cursor));
+                }
             }
             Update::Error(err) => anyhow::bail!("the remote connection failed: {err}"),
         }
@@ -759,12 +774,17 @@ impl<'a, B: Backend> Session<'a, B> {
         if layout.is_reply_to_us() {
             match layout.status {
                 ResizeStatus::Success => {
-                    self.resize = Resize::Native;
+                    self.resize = if self.mode.negotiates_size() {
+                        Resize::Native
+                    } else {
+                        Resize::Available
+                    };
                     self.on_remote_size(layout.screen, None).await?;
-                    // The terminal may have been resized again while the request
-                    // was in flight, so check we are still in sync. A no-op unless
-                    // our own target actually moved.
-                    self.request_native_size(false).await?;
+                    // In size-negotiating modes, re-check in case the terminal resized
+                    // while the request was in flight. Custom manual resolutions stay put.
+                    if self.mode.negotiates_size() {
+                        self.request_native_size(false).await?;
+                    }
                 }
                 // The server passed the request on and cannot say yet, so keep
                 // waiting: a later layout may report success.
@@ -784,7 +804,7 @@ impl<'a, B: Backend> Session<'a, B> {
             self.on_remote_size(layout.screen, None).await?;
             if was_probing && !self.screens.is_empty() {
                 self.resize = Resize::Available;
-                if self.mode == ScaleMode::Native {
+                if self.mode.negotiates_size() {
                     self.request_native_size(false).await?;
                 }
             }
@@ -794,21 +814,37 @@ impl<'a, B: Backend> Session<'a, B> {
 
     /// The pixel size we want the remote desktop to be.
     ///
+    /// In percentage modes this is `image_area / scale`, so scaling the remote
+    /// desktop fills the window without cropping (like HiDPI display scaling).
     /// Rounded down to even numbers: some servers snap to modes with even
     /// dimensions, and asking for something they will only approximate wastes a
     /// round trip.
     fn target_size(&self) -> (u16, u16) {
         let (w, h) = self.metrics.image_area();
+        let (w, h) = match self.mode {
+            ScaleMode::Percent(pct) => {
+                let scale = f64::from(pct) / 100.0;
+                (
+                    (f64::from(w) / scale)
+                        .floor()
+                        .clamp(0.0, f64::from(u16::MAX)) as u32,
+                    (f64::from(h) / scale)
+                        .floor()
+                        .clamp(0.0, f64::from(u16::MAX)) as u32,
+                )
+            }
+            _ => (w, h),
+        };
         (
             (w.min(u32::from(u16::MAX)) as u16) & !1,
             (h.min(u32::from(u16::MAX)) as u16) & !1,
         )
     }
 
-    /// Ask the server to match the terminal exactly.
+    /// Ask the server to match the terminal's target size.
     async fn request_native_size(&mut self, force: bool) -> Result<()> {
         let want = self.target_size();
-        if want.0 == 0 || want.1 == 0 {
+        if want.0 == 0 || want.1 == 0 || !framebuffer_size_is_plausible(want) {
             return Ok(());
         }
         if want == self.remote {
@@ -1045,7 +1081,9 @@ impl<'a, B: Backend> Session<'a, B> {
                 self.set_note("full refresh requested".into());
             }
             Command::Renegotiate => {
-                self.mode = ScaleMode::Native;
+                if !self.mode.negotiates_size() {
+                    self.mode = ScaleMode::Native;
+                }
                 self.resize = Resize::Probing;
                 self.requested_size = None;
                 self.request_native_size(true).await?;
@@ -1053,6 +1091,7 @@ impl<'a, B: Backend> Session<'a, B> {
             }
             Command::CycleMode => self.set_mode(self.mode.next()).await?,
             Command::Mode(mode) => self.set_mode(mode).await?,
+            Command::StepZoom(delta) => self.set_mode(self.mode.step_percent(delta)).await?,
             Command::Pan(dx, dy) => {
                 let layout = *self.renderer.layout();
                 let (max_x, max_y) = layout.pan_limits();
@@ -1091,18 +1130,25 @@ impl<'a, B: Backend> Session<'a, B> {
                 );
             }
             Command::ToggleStats => self.show_stats = !self.show_stats,
+            Command::ToggleRemoteCursor => {
+                self.set_remote_cursor(!self.show_remote_cursor);
+            }
+            Command::RemoteCursor(show) => {
+                self.set_remote_cursor(show);
+            }
             Command::Theme(theme) => {
                 self.theme = theme;
                 // The menu is redrawn in the new palette on the next tick; the cells it
                 // has already coloured are overwritten there rather than erased.
-                self.set_note(format!(
-                    "theme: {}",
-                    if theme == Theme::Dark {
-                        "dark"
-                    } else {
-                        "light"
-                    }
-                ));
+                let label = match theme {
+                    Theme::Auto => match theme.resolve(self.detected_scheme) {
+                        ColorScheme::Dark => "auto (dark)",
+                        ColorScheme::Light => "auto (light)",
+                    },
+                    Theme::Dark => "dark",
+                    Theme::Light => "light",
+                };
+                self.set_note(format!("theme: {label}"));
             }
             Command::Menu => {
                 if self.show_menu {
@@ -1122,13 +1168,21 @@ impl<'a, B: Backend> Session<'a, B> {
     async fn set_mode(&mut self, mode: ScaleMode) -> Result<()> {
         self.mode = mode;
         self.pan = (0, 0);
-        if mode == ScaleMode::Native {
+        self.relayout();
+        if mode == ScaleMode::Native
+            || (mode.negotiates_size()
+                && !matches!(self.resize, Resize::Unsupported | Resize::Refused(_)))
+        {
             self.requested_size = None;
             self.request_native_size(true).await?;
-        } else {
-            self.relayout();
         }
-        self.set_note(format!("scaling: {}", describe(self.renderer.layout())));
+        let label = match mode {
+            ScaleMode::Percent(pct) if matches!(self.resize, Resize::Waiting { .. }) => {
+                format!("{pct}%")
+            }
+            _ => describe(self.renderer.layout()).into_owned(),
+        };
+        self.set_note(format!("scaling: {label}"));
         Ok(())
     }
 
@@ -1167,11 +1221,43 @@ impl<'a, B: Backend> Session<'a, B> {
         Ok(())
     }
 
+    fn set_remote_cursor(&mut self, show: bool) {
+        self.show_remote_cursor = show;
+        if show {
+            self.renderer.set_cursor(self.remote_cursor.clone());
+            if let Some((tx, ty)) = self.pointer_px {
+                let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
+                self.renderer.move_cursor(at);
+            }
+            self.set_note("cursor: remote".into());
+        } else {
+            self.renderer.set_cursor(None);
+            self.set_note("cursor: local".into());
+        }
+    }
+
     /// What the menu should mark as being in force.
     fn menu_state(&self) -> menu::State {
         menu::State {
             mode: self.mode,
             theme: self.theme,
+            detected_scheme: self.detected_scheme,
+            remote_cursor: self.show_remote_cursor,
+        }
+    }
+
+    fn palette(&self) -> &'static Palette {
+        self.theme.palette(self.detected_scheme)
+    }
+
+    /// Adopt a live dark/light change reported by the terminal (mode 2031).
+    fn on_color_scheme(&mut self, scheme: ColorScheme) {
+        if self.detected_scheme == Some(scheme) {
+            return;
+        }
+        self.detected_scheme = Some(scheme);
+        if self.theme == Theme::Auto {
+            self.menu_dirty = true;
         }
     }
 
@@ -1212,8 +1298,8 @@ impl<'a, B: Backend> Session<'a, B> {
                 self.metrics.px_h
             );
             self.relayout();
-            if self.mode == ScaleMode::Native
-                || matches!(self.resize, Resize::Native | Resize::Waiting { .. })
+            if self.mode.negotiates_size()
+                && !matches!(self.resize, Resize::Unsupported | Resize::Refused(_))
             {
                 self.request_native_size(false).await?;
             }
@@ -1460,16 +1546,13 @@ impl<'a, B: Backend> Session<'a, B> {
     /// the menu -- a note that arrives while the menu is open belongs on top of it.
     /// A reply to this frame's query makes its click targets current.
     fn render_chrome(&mut self) -> MouseTargets {
+        let palette = self.palette();
         if self.show_menu && self.metrics.image_rows() == 0 {
             return MouseTargets {
                 metrics: self.metrics,
                 menu_open: true,
                 menu: None,
-                footer: status::compact_menu(
-                    self.chrome.buffer(),
-                    &self.metrics,
-                    self.theme.palette(),
-                ),
+                footer: status::compact_menu(self.chrome.buffer(), &self.metrics, palette),
             };
         }
         let footer = status::FooterActions {
@@ -1483,7 +1566,7 @@ impl<'a, B: Backend> Session<'a, B> {
             None
         };
         self.toast
-            .render(self.chrome.buffer(), &self.metrics, self.theme.palette());
+            .render(self.chrome.buffer(), &self.metrics, palette);
         MouseTargets {
             metrics: self.metrics,
             menu_open: self.show_menu,
@@ -1531,7 +1614,7 @@ impl<'a, B: Backend> Session<'a, B> {
             format!("{:>6}  ", format_rtt(self.rtt))
         };
 
-        let ink = self.theme.palette();
+        let ink = self.palette();
         let mut key = ink.bright(match menu_key {
             MenuKey::F8 => "F8",
             MenuKey::None => "commands",

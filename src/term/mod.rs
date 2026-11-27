@@ -31,16 +31,18 @@ static FULL_SCREEN: AtomicBool = AtomicBool::new(false);
 /// held as far as the remote is concerned, and a background window with mode
 /// `1003` still armed can keep tracking the pointer behind another application.
 const SETUP: &str = concat!(
-    "\x1b[?1049h", // alternate screen
-    "\x1b[?25l",   // hide the text cursor
-    "\x1b[?7l",    // no autowrap
-    "\x1b[?1003h", // report all mouse motion
-    "\x1b[?1006h", // SGR mouse framing
-    "\x1b[?1016h", // ... in pixels
-    "\x1b[?2004h", // bracketed paste
-    "\x1b[?1004h", // focus in/out, so held input releases and motion pauses on focus loss
-    "\x1b[>15u",   // kitty keyboard: disambiguate | event types | alternate keys | all keys
-    "\x1b[0m",     // erase with the default background so desktop tiles show through
+    "\x1b[?1049h",           // alternate screen
+    "\x1b[?25l",             // hide the text cursor
+    "\x1b[?7l",              // no autowrap
+    "\x1b[?1003h",           // report all mouse motion
+    "\x1b[?1006h",           // SGR mouse framing
+    "\x1b[?1016h",           // ... in pixels
+    "\x1b[?2004h",           // bracketed paste
+    "\x1b[?1004h",           // focus in/out, so held input releases and motion pauses on focus loss
+    "\x1b[?2031h",           // dark/light colour scheme change notifications
+    "\x1b]22;default\x1b\\", // OS arrow pointer instead of terminal I-beam (OSC 22)
+    "\x1b[>15u", // kitty keyboard: disambiguate | event types | alternate keys | all keys
+    "\x1b[0m",   // erase with the default background so desktop tiles show through
     "\x1b[2J",
 );
 
@@ -55,6 +57,8 @@ pub const DISABLE_MOUSE_MOTION: &[u8] = b"\x1b[?1003l";
 const TEARDOWN: &str = concat!(
     "\x1b_Ga=d,d=A,q=2\x1b\\",
     "\x1b[<u",
+    "\x1b]22;\x1b\\",
+    "\x1b[?2031l",
     "\x1b[?1004l",
     "\x1b[?2004l",
     "\x1b[?1016l",

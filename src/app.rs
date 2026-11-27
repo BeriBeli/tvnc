@@ -5,6 +5,7 @@
 //! the pixel pipeline is sound and anything wrong afterwards is the protocol's
 //! fault, not the renderer's.
 
+use std::borrow::Cow;
 use std::time::{Duration, Instant};
 
 use anyhow::Result;
@@ -100,9 +101,11 @@ pub fn run_test_pattern(
     let menu = Menu::new(args.menu_key);
     let state = menu::State {
         mode: args.scale,
-        theme: Theme::Dark,
+        theme: Theme::Auto,
+        detected_scheme: caps.color_scheme,
+        remote_cursor: args.remote_cursor,
     };
-    let ink = state.theme.palette();
+    let ink = state.palette();
     let mut show_menu = false;
     let mut menu_shown = false;
     let mut chrome = Chrome::new();
@@ -305,13 +308,15 @@ pub fn run_test_pattern(
 }
 
 /// A short description of the active mapping, for the status line.
-pub fn describe(layout: &Layout) -> &'static str {
+pub fn describe(layout: &Layout) -> Cow<'static, str> {
     match (layout.mode, layout.is_pixel_exact(), layout.is_cropped()) {
-        (ScaleMode::Native, true, false) => "native 1:1",
-        (_, true, true) => "1:1 cropped",
-        (_, true, false) => "1:1",
-        (ScaleMode::Integer, false, _) => "integer",
-        _ => "scaled",
+        (ScaleMode::Native, true, false) => Cow::Borrowed("native 1:1"),
+        (ScaleMode::Percent(pct), _, true) => Cow::Owned(format!("{pct}% cropped")),
+        (ScaleMode::Percent(pct), _, false) => Cow::Owned(format!("{pct}%")),
+        (_, true, true) => Cow::Borrowed("1:1 cropped"),
+        (_, true, false) => Cow::Borrowed("1:1"),
+        (ScaleMode::Integer, false, _) => Cow::Borrowed("integer"),
+        _ => Cow::Borrowed("scaled"),
     }
 }
 
@@ -356,6 +361,12 @@ mod tests {
         assert_eq!(describe(&cropped), "1:1 cropped");
         let scaled = Layout::compute(&m, ScaleMode::Fit, 1920, 1080, (0, 0));
         assert_eq!(describe(&scaled), "scaled");
+        let pct_fit = Layout::compute(&m, ScaleMode::Percent(125), 1280, 666, (0, 0));
+        assert_eq!(describe(&pct_fit), "125%");
+        let pct_cropped = Layout::compute(&m, ScaleMode::Percent(125), 1920, 1080, (0, 0));
+        assert_eq!(describe(&pct_cropped), "125% cropped");
+        let pct_100 = Layout::compute(&m, ScaleMode::Percent(100), 1600, 833, (0, 0));
+        assert_eq!(describe(&pct_100), "100%");
     }
 
     #[test]

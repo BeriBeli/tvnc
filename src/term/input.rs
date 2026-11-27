@@ -56,12 +56,18 @@ pub enum Command {
     /// Step to the next scaling mode.
     CycleMode,
     /// Go straight to one scaling mode. No key reaches this: one binding cannot
-    /// name four modes, which is why the key cycles instead. A pointer can name
+    /// name every mode, which is why the key cycles instead. A pointer can name
     /// one, so the menu offers them as a row to choose from.
     Mode(ScaleMode),
+    /// Step the percentage zoom up (`+1`) or down (`-1`) through the presets.
+    StepZoom(i8),
     Pan(i32, i32),
     ToggleViewOnly,
     ToggleStats,
+    /// Toggle between the OS pointer alone and drawing the remote cursor bitmap.
+    ToggleRemoteCursor,
+    /// Explicitly pick local-only (`false`) or remote-overlay (`true`) cursor.
+    RemoteCursor(bool),
     /// Show the command menu, or put it away if it is already up.
     Menu,
     /// Wear a palette. No key reaches this either: it is a choice rather than a step,
@@ -157,13 +163,22 @@ impl InputMapper {
     }
 
     fn local_command(&self, ev: KeyEvent, focus: InputFocus) -> Option<Command> {
-        if ev.kind != KeyEventKind::Press || !ev.modifiers.is_empty() {
+        if ev.kind != KeyEventKind::Press {
             return None;
         }
-        if self.menu_key == MenuKey::F8 && ev.code == KeyCode::F(8) {
+        if self.menu_key == MenuKey::F8 && ev.modifiers.is_empty() && ev.code == KeyCode::F(8) {
             return Some(Command::Menu);
         }
         if focus != InputFocus::Menu {
+            return None;
+        }
+        // `+` arrives with SHIFT on layouts where it shares a key with `=`.
+        if matches!(ev.code, KeyCode::Char('+') | KeyCode::Char('='))
+            && (ev.modifiers.is_empty() || ev.modifiers == KeyModifiers::SHIFT)
+        {
+            return Some(Command::StepZoom(1));
+        }
+        if !ev.modifiers.is_empty() {
             return None;
         }
         Some(match ev.code {
@@ -173,8 +188,10 @@ impl InputMapper {
             KeyCode::Char('f') => Command::FullRefresh,
             KeyCode::Char('r') => Command::Renegotiate,
             KeyCode::Char('m') => Command::CycleMode,
+            KeyCode::Char('-') => Command::StepZoom(-1),
             KeyCode::Char('v') => Command::ToggleViewOnly,
             KeyCode::Char('c') => Command::ToggleStats,
+            KeyCode::Char('p') => Command::ToggleRemoteCursor,
             KeyCode::Left => Command::Pan(-1, 0),
             KeyCode::Right => Command::Pan(1, 0),
             KeyCode::Up => Command::Pan(0, -1),
@@ -981,8 +998,12 @@ mod tests {
             (KeyCode::Char('f'), Command::FullRefresh),
             (KeyCode::Char('r'), Command::Renegotiate),
             (KeyCode::Char('m'), Command::CycleMode),
+            (KeyCode::Char('-'), Command::StepZoom(-1)),
+            (KeyCode::Char('='), Command::StepZoom(1)),
+            (KeyCode::Char('+'), Command::StepZoom(1)),
             (KeyCode::Char('v'), Command::ToggleViewOnly),
             (KeyCode::Char('c'), Command::ToggleStats),
+            (KeyCode::Char('p'), Command::ToggleRemoteCursor),
             (KeyCode::Left, Command::Pan(-1, 0)),
             (KeyCode::Right, Command::Pan(1, 0)),
             (KeyCode::Up, Command::Pan(0, -1)),
@@ -995,9 +1016,28 @@ mod tests {
             );
         }
         assert_eq!(
-            input.on_key(press(KeyCode::Char('p')), NO_ALTERNATES, Menu),
+            input.on_key(press(KeyCode::Char('z')), NO_ALTERNATES, Menu),
             (vec![], None)
         );
+        // Shifted `+` / `=` still steps zoom in the menu; Ctrl/Alt do not.
+        for code in [KeyCode::Char('+'), KeyCode::Char('=')] {
+            assert_eq!(
+                input.on_key(
+                    key(code, KeyEventKind::Press, KeyModifiers::SHIFT),
+                    NO_ALTERNATES,
+                    Menu
+                ),
+                (vec![], Some(Command::StepZoom(1)))
+            );
+            assert_eq!(
+                input.on_key(
+                    key(code, KeyEventKind::Press, KeyModifiers::CONTROL),
+                    NO_ALTERNATES,
+                    Menu
+                ),
+                (vec![], None)
+            );
+        }
     }
 
     #[test]

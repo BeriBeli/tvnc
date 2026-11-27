@@ -10,6 +10,8 @@ use anyhow::{Context, Result};
 use base64::Engine as _;
 use base64::engine::general_purpose::STANDARD as BASE64;
 
+use crate::ui::theme::{ColorScheme, Rgb};
+
 /// How long to wait for the terminal to answer. The replies come back in a
 /// single round trip, so this only has to cover terminal latency.
 const PROBE_TIMEOUT: Duration = Duration::from_millis(300);
@@ -49,6 +51,8 @@ pub struct Caps {
     pub cell_px: Option<(u32, u32)>,
     /// Primary device attributes, for the record.
     pub da1: Option<String>,
+    /// Terminal dark/light appearance, from `CSI ? 996 n` or `OSC 11`.
+    pub color_scheme: Option<ColorScheme>,
 }
 
 /// Ask the terminal everything we want to know, in one round trip.
@@ -70,6 +74,8 @@ pub fn probe() -> Result<Caps> {
     req.extend_from_slice(b"\x1b[?1016$p"); // DECRQM: SGR-pixel mouse
     req.extend_from_slice(b"\x1b[?2026$p"); // DECRQM: synchronised output
     req.extend_from_slice(b"\x1b[?u"); // kitty keyboard: report current flags
+    req.extend_from_slice(b"\x1b[?996n"); // dark/light colour scheme
+    req.extend_from_slice(b"\x1b]11;?\x1b\\"); // OSC 11: background colour fallback
 
     // Ask whether pixels can arrive through shared memory. The query action
     // validates the transmission without storing anything, so this costs one
@@ -165,6 +171,8 @@ enum Seq<'a> {
     Csi { body: &'a [u8], final_byte: u8 },
     /// `APC` payload, without the introducer or the string terminator.
     Apc(&'a [u8]),
+    /// `OSC` payload, without the introducer or terminator (BEL or ST).
+    Osc(&'a [u8]),
 }
 
 fn is_da1(seq: &Seq<'_>) -> bool {
@@ -231,6 +239,29 @@ fn sequences(buf: &[u8]) -> Vec<Seq<'_>> {
                     None => break, // truncated
                 }
             }
+            b']' => {
+                let start = i + 2;
+                let mut j = start;
+                let mut end = None;
+                while j < buf.len() {
+                    if buf[j] == 0x07 || buf[j] == 0x9c {
+                        end = Some((j, j + 1));
+                        break;
+                    }
+                    if buf[j] == 0x1b && j + 1 < buf.len() && buf[j + 1] == b'\\' {
+                        end = Some((j, j + 2));
+                        break;
+                    }
+                    j += 1;
+                }
+                match end {
+                    Some((payload_end, next)) => {
+                        out.push(Seq::Osc(&buf[start..payload_end]));
+                        i = next;
+                    }
+                    None => break, // truncated
+                }
+            }
             _ => i += 2,
         }
     }
@@ -239,6 +270,8 @@ fn sequences(buf: &[u8]) -> Vec<Seq<'_>> {
 
 fn parse_caps(buf: &[u8]) -> Caps {
     let mut caps = Caps::default();
+    let mut csi_scheme = None;
+    let mut osc_scheme = None;
 
     for seq in sequences(buf) {
         match seq {
@@ -250,10 +283,20 @@ fn parse_caps(buf: &[u8]) -> Caps {
                 Some((PROBE_SHM_ID, b"OK")) => caps.shm_graphics = true,
                 _ => {}
             },
+            Seq::Osc(payload) => {
+                if let Some(rgb) = osc_background_rgb(payload) {
+                    osc_scheme = Some(ColorScheme::from_background(rgb));
+                }
+            }
             Seq::Csi { body, final_byte } => match final_byte {
                 b'c' => {
                     if let Some(params) = da1_parameters(body) {
                         caps.da1 = Some(String::from_utf8_lossy(params).into_owned());
+                    }
+                }
+                b'n' => {
+                    if let Some(scheme) = color_scheme_reply(body) {
+                        csi_scheme = Some(scheme);
                     }
                 }
                 b't' => {
@@ -290,7 +333,47 @@ fn parse_caps(buf: &[u8]) -> Caps {
             },
         }
     }
+    // Prefer an explicit semantic colour-scheme reply over background luminance.
+    caps.color_scheme = csi_scheme.or(osc_scheme);
     caps
+}
+
+/// Dark/light colour-scheme notification (`CSI ? 997 ; 1 n` = dark, `2` = light).
+pub(super) fn color_scheme_reply(body: &[u8]) -> Option<ColorScheme> {
+    let rest = body.strip_prefix(b"?")?;
+    match params(rest)[..] {
+        [997, 1] => Some(ColorScheme::Dark),
+        [997, 2] => Some(ColorScheme::Light),
+        _ => None,
+    }
+}
+
+/// Parse an `OSC 11 ; rgb:RRRR/GGGG/BBBB` background colour reply into 8-bit RGB.
+fn osc_background_rgb(payload: &[u8]) -> Option<Rgb> {
+    let text = std::str::from_utf8(payload).ok()?;
+    let rest = text.strip_prefix("11;")?;
+    let spec = rest
+        .strip_prefix("rgb:")
+        .or_else(|| rest.strip_prefix("RGB:"))?;
+    let mut parts = spec.split('/');
+    let r = parse_hex_channel(parts.next()?)?;
+    let g = parse_hex_channel(parts.next()?)?;
+    let b = parse_hex_channel(parts.next()?)?;
+    if parts.next().is_some() {
+        return None;
+    }
+    Some((r, g, b))
+}
+
+fn parse_hex_channel(hex: &str) -> Option<u8> {
+    let v = u16::from_str_radix(hex, 16).ok()?;
+    match hex.len() {
+        1 => Some((v as u8) * 0x11),
+        2 => Some(v as u8),
+        3 => Some((v >> 4) as u8),
+        4 => Some((v >> 8) as u8),
+        _ => None,
+    }
 }
 
 /// Numeric parameters of a CSI body, stopping at the first intermediate byte
@@ -404,6 +487,26 @@ mod tests {
         assert!(caps.kitty_graphics_reply);
         assert!(!caps.kitty_graphics);
         assert!(!caps.shm_graphics);
+    }
+
+    #[test]
+    fn detects_dark_and_light_theme_from_csi_997_and_osc_11() {
+        let light_csi = parse_caps(b"\x1b[?997;2n\x1b[?62;c");
+        assert_eq!(light_csi.color_scheme, Some(ColorScheme::Light));
+
+        let dark_csi = parse_caps(b"\x1b[?997;1n\x1b[?62;c");
+        assert_eq!(dark_csi.color_scheme, Some(ColorScheme::Dark));
+
+        // OSC 11 fallback with both ST and BEL terminators.
+        let light_osc = parse_caps(b"\x1b]11;rgb:fafa/fafa/fafa\x1b\\\x1b[?62;c");
+        assert_eq!(light_osc.color_scheme, Some(ColorScheme::Light));
+
+        let dark_osc = parse_caps(b"\x1b]11;rgb:1e1e/1e1e/2e2e\x07\x1b[?62;c");
+        assert_eq!(dark_osc.color_scheme, Some(ColorScheme::Dark));
+
+        // Explicit CSI ? 997 n wins over OSC 11 when both are present.
+        let both = parse_caps(b"\x1b[?997;2n\x1b]11;rgb:0000/0000/0000\x1b\\\x1b[?62;c");
+        assert_eq!(both.color_scheme, Some(ColorScheme::Light));
     }
 
     #[test]

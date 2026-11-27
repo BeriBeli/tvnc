@@ -1593,6 +1593,106 @@ fn clicking_a_scaling_option_selects_that_one() {
 }
 
 #[test]
+fn clicking_a_percentage_option_in_the_menu_resizes_the_remote_desktop() {
+    let (server, mut term) = start(Resize::Accept, (1024, 768));
+    assert_pixel_exact(&term, Duration::from_secs(10));
+
+    term.send(F8);
+    assert!(wait_for_text(&term, "125%", Duration::from_secs(10)));
+
+    let screen = Screen::of(&term.output());
+    let (row, col) = (0..usize::from(ROWS))
+        .find_map(|row| {
+            let line = screen.row(row);
+            line.contains("100%")
+                .then(|| (row, line.find("125%").unwrap()))
+        })
+        .expect("missing percentage scaling row");
+    click_at(&mut term, col as u16 * 8 + 1, row as u16 * 17 + 1);
+
+    assert!(
+        wait_for_text(&term, "[125%]", Duration::from_secs(10)),
+        "brackets did not move to 125%: {}",
+        tail(&term.output())
+    );
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| matches!(
+                r,
+                Request::SetDesktopSize {
+                    width: 1280,
+                    height: 666,
+                    ..
+                }
+            ))
+            .is_some(),
+        "clicking 125% did not ask the server to resize to 1280x666"
+    );
+    assert_reports_size(&term, "1280x666 -> 1600x833  125%", Duration::from_secs(10));
+
+    // Pressing `+` in the open menu steps from 125% to 150% (1600/1.5=1066, 833/1.5=554).
+    term.send(b"+");
+    assert!(
+        wait_for_text(&term, "[150%]", Duration::from_secs(10)),
+        "`+` did not step to 150%: {}",
+        tail(&term.output())
+    );
+    assert!(
+        server
+            .wait_for(Duration::from_secs(10), |r| matches!(
+                r,
+                Request::SetDesktopSize {
+                    width: 1066,
+                    height: 554,
+                    ..
+                }
+            ))
+            .is_some(),
+        "`+` did not ask the server to resize to 1066x554"
+    );
+
+    term.send(b"q");
+    assert!(term.wait(Duration::from_secs(10)).unwrap().success());
+}
+
+#[test]
+fn auto_theme_adapts_to_startup_probe_and_live_mode_2031_updates() {
+    let server = FakeServer::start(1024, 768, Resize::Accept);
+    let addr = server.addr.to_string();
+    let mut term = FakeTerm::spawn(
+        COLS,
+        ROWS,
+        PIXELS.0,
+        PIXELS.1,
+        &[&addr, "--fps", "15", "--scale", "native"],
+    );
+    // Report a light terminal colour scheme in the startup probe.
+    let mut light_probe = b"\x1b[?997;2n".to_vec();
+    light_probe.extend_from_slice(GHOSTTY_REPLIES);
+    term.answer_probe(&light_probe);
+
+    // Light palette bar background is rgb(238, 238, 238).
+    let light_bg = b"\x1b[48;2;238;238;238m";
+    let dark_bg = b"\x1b[48;2;10;10;10m";
+    assert!(
+        term.wait_for(light_bg, Duration::from_secs(10)),
+        "auto theme did not adopt light palette from startup probe"
+    );
+
+    // Live mode-2031 switch to dark appearance repaints the chrome in the dark palette.
+    let mark = term.output().len();
+    term.send(b"\x1b[?997;1n");
+    assert!(
+        term.wait_for_after(mark, dark_bg, Duration::from_secs(10))
+            .is_some(),
+        "auto theme did not switch to dark palette on CSI ?997;1n"
+    );
+
+    quit(&mut term);
+    assert!(term.wait(Duration::from_secs(10)).unwrap().success());
+}
+
+#[test]
 fn clicking_the_close_button_puts_the_notification_away() {
     // A click on the popup's `[x]` has to take
     // the box off the screen before its linger is up -- and take it off properly, the
