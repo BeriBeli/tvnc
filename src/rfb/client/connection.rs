@@ -274,8 +274,10 @@ impl Drop for VncInner {
     }
 }
 
+#[derive(Clone)]
 pub struct VncClient {
     inner: Arc<Mutex<VncInner>>,
+    pub(crate) password_authenticated: bool,
 }
 
 impl VncClient {
@@ -286,11 +288,13 @@ impl VncClient {
         encodings: Vec<VncEncoding>,
         quality: Option<u8>,
         compression: Option<u8>,
+        password_authenticated: bool,
     ) -> Result<Self, VncError>
     where
         S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
     {
         Ok(Self {
+            password_authenticated,
             inner: Arc::new(Mutex::new(
                 VncInner::new(
                     stream,
@@ -327,14 +331,6 @@ impl VncClient {
     /// Stop the engine and release its tasks.
     pub async fn close(&self) {
         self.inner.lock().await.close();
-    }
-}
-
-impl Clone for VncClient {
-    fn clone(&self) -> Self {
-        Self {
-            inner: self.inner.clone(),
-        }
     }
 }
 

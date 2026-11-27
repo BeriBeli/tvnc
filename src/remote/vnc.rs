@@ -15,14 +15,15 @@ use tokio::net::TcpStream;
 
 use super::{Connect, ConnectError, Input, Rect, ResizeStatus, Update};
 use crate::rfb::{
-    ClipboardCaps, PixelFormat, VncClient, VncConnector, VncEncoding, VncError, VncEvent, X11Event,
+    ClipboardCaps, PixelFormat, VncClient, VncConnector, VncEncoding, VncError, VncEvent,
+    VncPassword, X11Event,
 };
 
 /// How long to wait for the TCP connection.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
 /// Marks a fence as our own latency probe rather than a synchronisation request.
-const RTT_PROBE_MARKER: &[u8] = b"desktui-rtt";
+const RTT_PROBE_MARKER: &[u8] = b"tvnc-rtt";
 
 /// What to ask the server for, once connected.
 #[derive(Debug, Clone, Copy, Default)]
@@ -46,12 +47,12 @@ pub struct Options {
 /// An RFB server, and what it takes to connect to it.
 pub struct Vnc {
     addr: String,
-    password: Option<String>,
+    password: Option<VncPassword>,
     opts: Options,
 }
 
 impl Vnc {
-    pub fn new(addr: String, password: Option<String>, opts: Options) -> Self {
+    pub fn new(addr: String, password: Option<VncPassword>, opts: Options) -> Self {
         Self {
             addr,
             password,
@@ -67,8 +68,8 @@ impl Connect for Vnc {
         &self.addr
     }
 
-    fn use_password(&mut self, password: String) {
-        self.password = Some(password);
+    fn use_password(&mut self, password: Vec<u8>) {
+        self.password = Some(password.into());
     }
 
     async fn connect(&self) -> Result<Self::Backend, ConnectError> {
@@ -78,7 +79,9 @@ impl Connect for Vnc {
                 // answer SetEncodings before it sends a single rectangle, and
                 // continuous updates enabled for a 0x0 rectangle is a black screen.
                 let size = client.resolution().await;
-                Ok(VncBackend::new(client, size, self.opts))
+                let read_only = client.password_authenticated
+                    && self.password.as_ref().is_some_and(|p| p.view_only);
+                Ok(VncBackend::new(client, size, self.opts, read_only))
             }
             Err(VncError::NoPassword) => Err(ConnectError::NeedsPassword),
             Err(err) => Err(ConnectError::Failed(
@@ -97,7 +100,7 @@ impl Vnc {
         // Input latency is the whole point; do not let Nagle sit on a click.
         stream.set_nodelay(true).map_err(VncError::IoError)?;
 
-        let password = self.password.clone();
+        let password = self.password.as_ref().map(|p| p.bytes.clone());
         VncConnector::new(stream)
             .set_auth_method(async move { password.ok_or(VncError::NoPassword) })
             // Order is preference order. Tight first: it is what every modern server
@@ -207,12 +210,14 @@ struct State {
 pub struct VncBackend {
     client: VncClient,
     state: Mutex<State>,
+    read_only: bool,
 }
 
 impl VncBackend {
-    fn new(client: VncClient, size: (u16, u16), opts: Options) -> Self {
+    fn new(client: VncClient, size: (u16, u16), opts: Options, read_only: bool) -> Self {
         Self {
             client,
+            read_only,
             state: Mutex::new(State {
                 size,
                 clipboard_wanted: opts.clipboard,
@@ -447,6 +452,10 @@ impl State {
 }
 
 impl super::Backend for VncBackend {
+    fn is_read_only(&self) -> bool {
+        self.read_only
+    }
+
     async fn recv(&self) -> Result<Update> {
         loop {
             // Before reading, so that a cancellation costs at most a repeated flush.

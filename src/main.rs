@@ -1,4 +1,4 @@
-//! desktui: a remote desktop client that draws with the Kitty graphics protocol,
+//! tvnc: a remote desktop client that draws with the Kitty graphics protocol,
 //! one remote pixel per terminal pixel.
 
 mod app;
@@ -10,16 +10,15 @@ mod session;
 mod term;
 mod ui;
 
-use std::io::Write;
+use std::io::{Read, Write};
 
 use anyhow::{Context, Result};
-use clap::Parser;
 
 use cli::Args;
 use term::{Metrics, TerminalGuard, caps};
 
 fn main() -> std::process::ExitCode {
-    let args = Args::parse();
+    let args = Args::from_env();
     init_logging(&args);
 
     match run(&args) {
@@ -27,7 +26,7 @@ fn main() -> std::process::ExitCode {
         Err(err) => {
             // The guard is gone by now, so the terminal is back to normal and
             // this lands on the primary screen where the user can read it.
-            let _ = writeln!(std::io::stderr(), "desktui: {err:#}");
+            let _ = writeln!(std::io::stderr(), "tvnc: {err:#}");
             std::process::ExitCode::FAILURE
         }
     }
@@ -38,11 +37,12 @@ fn run(args: &Args) -> Result<()> {
     // screen so an unsupported terminal can be refused without a screen flash.
     let guard = TerminalGuard::enter()?;
     let caps = caps::probe().context("failed to probe the terminal")?;
-    let metrics = Metrics::query()?;
+    let window = term::window_size()?;
+    let metrics = Metrics::from_probe(&window, &caps)?;
 
     if args.print_caps {
         drop(guard);
-        print_caps(&caps, &metrics);
+        print_caps(&caps, &metrics, term::ioctl_pixels(&window));
         return Ok(());
     }
 
@@ -51,9 +51,9 @@ fn run(args: &Args) -> Result<()> {
         anyhow::bail!(
             "this terminal did not answer the Kitty graphics query{}\n\
              \n\
-             desktui draws the remote screen as real pixels, which needs that \
+             tvnc draws the remote screen as real pixels, which needs that \
              protocol.\n\
-             Known-good terminals: Ghostty, kitty, WezTerm.\n\
+             Known-good terminals: Ghostty, kitty, Rex, WezTerm.\n\
              Run with --force to try anyway, or --print-caps to see what was \
              detected.",
             match &caps.da1 {
@@ -64,7 +64,7 @@ fn run(args: &Args) -> Result<()> {
     }
 
     if args.test_pattern {
-        return app::run_test_pattern(args, &caps, &guard);
+        return app::run_test_pattern(args, &caps, &guard, metrics);
     }
 
     let addr = args.server_addr()?;
@@ -88,24 +88,33 @@ fn run(args: &Args) -> Result<()> {
             push: !args.no_push,
         },
     );
-    runtime.block_on(session::run(args, &caps, &guard, &mut vnc))
+    runtime.block_on(session::run(args, &caps, &guard, metrics, &mut vnc))
 }
 
 /// A password from the arguments or the environment, if either has one.
 ///
 /// Otherwise `None`, and the session prompts only if the server actually asks.
-fn resolve_password(args: &Args) -> Result<Option<String>> {
-    if let Some(path) = &args.password_file {
-        let contents = std::fs::read_to_string(path)
+fn resolve_password(args: &Args) -> Result<Option<rfb::VncPassword>> {
+    if let Some(path) = &args.passwd {
+        // A TigerVNC file holds at most two 8-byte entries. Read one extra
+        // byte so an oversized file still fails the format check.
+        let mut contents = Vec::new();
+        std::fs::File::open(path)
+            .and_then(|file| file.take(17).read_to_end(&mut contents))
             .with_context(|| format!("failed to read the password file {}", path.display()))?;
-        let line = contents.lines().next().unwrap_or_default().to_string();
-        anyhow::ensure!(!line.is_empty(), "{} is empty", path.display());
-        return Ok(Some(line));
+        let password =
+            rfb::decode_tigervnc_passwd(&contents, args.view_only).with_context(|| {
+                format!(
+                    "expected an 8- or 16-byte TigerVNC vncpasswd file at {}",
+                    path.display()
+                )
+            })?;
+        return Ok(Some(password));
     }
     if let Ok(password) = std::env::var("VNC_PASSWORD")
         && !password.is_empty()
     {
-        return Ok(Some(password));
+        return Ok(Some(password.into_bytes().into()));
     }
     Ok(None)
 }
@@ -114,14 +123,12 @@ fn resolve_password(args: &Args) -> Result<Option<String>> {
 ///
 /// Raw mode is already on, so nothing is echoed and the read has to be done a
 /// byte at a time. Called only when the server has said it wants one.
-pub fn prompt_password(addr: &str) -> Result<String> {
-    use std::io::Read;
-
+pub fn prompt_password(addr: &str) -> Result<Vec<u8>> {
     let mut out = std::io::stdout();
     write!(out, "Password for {addr}: ")?;
     out.flush()?;
 
-    let mut password = String::new();
+    let mut password = Vec::new();
     let mut byte = [0u8; 1];
     let mut stdin = std::io::stdin();
     loop {
@@ -138,7 +145,7 @@ pub fn prompt_password(addr: &str) -> Result<String> {
             0x7f | 0x08 => {
                 password.pop();
             }
-            b => password.push(b as char),
+            b => password.push(b),
         }
     }
     write!(out, "\r\n")?;
@@ -146,7 +153,7 @@ pub fn prompt_password(addr: &str) -> Result<String> {
     Ok(password)
 }
 
-fn print_caps(caps: &caps::Caps, metrics: &Metrics) {
+fn print_caps(caps: &caps::Caps, metrics: &Metrics, ioctl_px: Option<(u32, u32)>) {
     let yes_no = |b: bool| if b { "yes" } else { "no" };
 
     println!("terminal");
@@ -185,7 +192,10 @@ fn print_caps(caps: &caps::Caps, metrics: &Metrics) {
         "  grid                 {} x {} cells",
         metrics.cols, metrics.rows
     );
-    println!("  ioctl pixel area     {} x {}", metrics.px_w, metrics.px_h);
+    match ioctl_px {
+        Some((w, h)) => println!("  ioctl pixel area     {w} x {h}"),
+        None => println!("  ioctl pixel area     (not reported)"),
+    }
     match caps.text_area_px {
         Some((w, h)) => println!("  CSI 14 t             {w} x {h}"),
         None => println!("  CSI 14 t             (no answer)"),
@@ -204,14 +214,11 @@ fn print_caps(caps: &caps::Caps, metrics: &Metrics) {
     // A mismatch here is the HiDPI trap: if one source reports device pixels and
     // the other reports points, everything downstream is off by the scale factor.
     let mut warned = false;
-    if let Some((w, h)) = caps.text_area_px
-        && (w, h) != (metrics.px_w, metrics.px_h)
+    if let (Some((iw, ih)), Some((w, h))) = (ioctl_px, caps.text_area_px)
+        && (w, h) != (iw, ih)
     {
         println!();
-        println!(
-            "warning: ioctl says {}x{} but CSI 14 t says {w}x{h}",
-            metrics.px_w, metrics.px_h
-        );
+        println!("warning: ioctl says {iw}x{ih} but CSI 14 t says {w}x{h}");
         warned = true;
     }
     if let Some((w, h)) = caps.cell_px
@@ -240,7 +247,7 @@ fn init_logging(args: &Args) {
     else {
         return;
     };
-    let filter = tracing_subscriber::EnvFilter::try_from_env("DESKTUI_LOG")
+    let filter = tracing_subscriber::EnvFilter::try_from_env("TVNC_LOG")
         .unwrap_or_else(|_| tracing_subscriber::EnvFilter::new("info"));
     let _ = tracing_subscriber::fmt()
         .with_env_filter(filter)

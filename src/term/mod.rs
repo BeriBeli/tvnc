@@ -1,6 +1,7 @@
 //! Terminal setup, teardown and geometry.
 
 pub mod caps;
+pub mod events;
 pub mod input;
 pub mod keysym;
 pub mod kitty;
@@ -22,13 +23,13 @@ static FULL_SCREEN: AtomicBool = AtomicBool::new(false);
 /// screen, and scrolling moves every graphics placement with it. Mouse reporting
 /// is `1003` (all motion, not just while dragging) plus `1006` for the SGR
 /// framing and `1016` to get that position in pixels rather than cells. The
-/// keyboard flags are disambiguate, report-event-types and report-all-keys,
-/// which is what turns key releases into events -- RFB needs down and up.
+/// keyboard flags request every key, its event type and the layout's shifted
+/// character. RFB needs both the symbol to type and a matching release.
 ///
 /// Focus reporting (`1004`) matters more than it looks: without it the terminal
 /// never says the window lost focus, so a modifier held while switching away stays
-/// held as far as the remote is concerned. The release-everything path existed
-/// already and was simply never reached.
+/// held as far as the remote is concerned, and a background window with mode
+/// `1003` still armed can keep tracking the pointer behind another application.
 const SETUP: &str = concat!(
     "\x1b[?1049h", // alternate screen
     "\x1b[?25l",   // hide the text cursor
@@ -37,10 +38,17 @@ const SETUP: &str = concat!(
     "\x1b[?1006h", // SGR mouse framing
     "\x1b[?1016h", // ... in pixels
     "\x1b[?2004h", // bracketed paste
-    "\x1b[?1004h", // focus in/out, so held keys can be released on focus loss
-    "\x1b[>11u",   // kitty keyboard: disambiguate | event types | all keys
+    "\x1b[?1004h", // focus in/out, so held input releases and motion pauses on focus loss
+    "\x1b[>15u",   // kitty keyboard: disambiguate | event types | alternate keys | all keys
+    "\x1b[0m",     // erase with the default background so desktop tiles show through
     "\x1b[2J",
 );
+
+/// Toggle all-motion mouse reporting as the terminal gains and loses focus, so
+/// an unfocused terminal window does not keep tracking the pointer while the
+/// user is working in another application.
+pub const ENABLE_MOUSE_MOTION: &[u8] = b"\x1b[?1003h";
+pub const DISABLE_MOUSE_MOTION: &[u8] = b"\x1b[?1003l";
 
 /// The inverse of [`SETUP`], plus a delete-all-images so no placements are left
 /// in the terminal's image store.
@@ -121,11 +129,8 @@ fn install_panic_hook() {
 
 /// The terminal's geometry, in both cells and pixels.
 ///
-/// Cell size is derived by division rather than taken from `CSI 16 t`: the
-/// numbers that matter are the ones consistent with the grid we address, and
-/// dividing the reported pixel area by the reported cell count guarantees that.
-/// The `CSI 16 t` answer is still collected during probing, where a mismatch
-/// between the two is worth reporting.
+/// When the terminal supplies a pixel area, derive cell size from the same grid
+/// the viewer addresses.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct Metrics {
     pub cols: u16,
@@ -136,23 +141,67 @@ pub struct Metrics {
     pub cell_h: u32,
 }
 
-impl Metrics {
-    /// Query the terminal, preferring `TIOCGWINSZ` because it costs no round
-    /// trip, and falling back to `CSI 14 t` when the kernel reports no pixel
-    /// size.
-    pub fn query() -> Result<Self> {
-        let (cols, rows) = terminal::size().context("failed to read terminal size")?;
-        anyhow::ensure!(cols > 0 && rows > 0, "terminal reports a zero-sized grid");
+/// Read the current grid and any pixel dimensions the kernel provides.
+pub fn window_size() -> Result<terminal::WindowSize> {
+    if let Ok(size) = terminal::window_size() {
+        return Ok(size);
+    }
+    let (columns, rows) = terminal::size().context("failed to read terminal size")?;
+    Ok(terminal::WindowSize {
+        columns,
+        rows,
+        width: 0,
+        height: 0,
+    })
+}
 
-        let (mut px_w, mut px_h) = match terminal::window_size() {
-            Ok(ws) => (u32::from(ws.width), u32::from(ws.height)),
-            Err(_) => (0, 0),
+pub fn ioctl_pixels(size: &terminal::WindowSize) -> Option<(u32, u32)> {
+    (size.width != 0 && size.height != 0).then(|| (u32::from(size.width), u32::from(size.height)))
+}
+
+fn area_from_cells(size: &terminal::WindowSize, cell: (u32, u32)) -> Result<(u32, u32)> {
+    let w = cell.0.checked_mul(u32::from(size.columns));
+    let h = cell.1.checked_mul(u32::from(size.rows));
+    w.zip(h).context("terminal pixel dimensions overflow")
+}
+
+impl Metrics {
+    /// Use the startup probe before the input reader and frame writer take ownership.
+    pub fn from_probe(size: &terminal::WindowSize, caps: &caps::Caps) -> Result<Self> {
+        Self::from_window(size, || {
+            if let Some(area) = caps.text_area_px.filter(|&(w, h)| w > 0 && h > 0) {
+                return Ok(area);
+            }
+            if let Some(cell) = caps.cell_px.filter(|&(w, h)| w > 0 && h > 0) {
+                return area_from_cells(size, cell);
+            }
+            // A terminal that missed the initial query still gets one startup retry.
+            caps::query_pixel_geometry()
+        })
+    }
+
+    /// A resize must not query the terminal over the input or output stream. If
+    /// the kernel omits pixels, apply the last measured cell size to the new grid.
+    pub fn refreshed(&self) -> Result<Self> {
+        let size = window_size()?;
+        Self::from_window(&size, || {
+            if (size.columns, size.rows) == (self.cols, self.rows) {
+                return Ok((self.px_w, self.px_h));
+            }
+            area_from_cells(&size, (self.cell_w, self.cell_h))
+        })
+    }
+
+    fn from_window(
+        size: &terminal::WindowSize,
+        fallback: impl FnOnce() -> Result<(u32, u32)>,
+    ) -> Result<Self> {
+        let (cols, rows) = (size.columns, size.rows);
+        anyhow::ensure!(cols > 0 && rows > 0, "terminal reports a zero-sized grid");
+        let (px_w, px_h) = match ioctl_pixels(size) {
+            Some(area) => area,
+            None => fallback()?,
         };
-        if px_w == 0 || px_h == 0 {
-            let (w, h) = caps::query_pixel_geometry()?;
-            px_w = w;
-            px_h = h;
-        }
         anyhow::ensure!(
             px_w > 0 && px_h > 0,
             "terminal did not report its size in pixels, which a pixel-exact \

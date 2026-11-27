@@ -28,7 +28,7 @@ use std::sync::{Arc, Mutex};
 use std::sync::{Condvar, LazyLock};
 use std::time::{Duration, Instant};
 
-pub const BIN: &str = env!("CARGO_BIN_EXE_desktui");
+pub const BIN: &str = env!("CARGO_BIN_EXE_tvnc");
 
 /// The escape that opens a frame. The client wraps each draw in synchronised output,
 /// so one of these begins everything a single frame has to say.
@@ -36,6 +36,8 @@ pub const BIN: &str = env!("CARGO_BIN_EXE_desktui");
 /// Only for the terminals that answer for mode 2026, which is every one here bar
 /// [`PLAIN_REPLIES`]: without the answer there is no wrapper to count.
 pub const FRAME: &[u8] = b"\x1b[?2026h";
+pub const LAYOUT_QUERY: &[u8] = b"\x1b[0c";
+pub const GRAPHICS_LAYOUT_QUERY: &[u8] = b"\x1b_Gi=1895,s=1,v=1,a=q,t=d,f=24;AAAA\x1b\\";
 
 /// Image id 1893 is 0x765, the id the client probes with.
 pub const GHOSTTY_REPLIES: &[u8] = b"\x1b_Gi=1893;OK\x1b\\\
@@ -108,6 +110,7 @@ pub struct FakeTerm {
     child: Child,
     master: std::fs::File,
     pub seen: Arc<Mutex<Vec<u8>>>,
+    capturing: Arc<AtomicBool>,
     /// Set by the drain thread when the pty has run dry, which cannot happen while a
     /// slave fd is still open. See [`FakeTerm::settle`].
     drained: Arc<AtomicBool>,
@@ -128,6 +131,29 @@ impl FakeTerm {
         ypixel: u16,
         args: &[&str],
         env: &[(&str, &str)],
+    ) -> Self {
+        Self::spawn_pty(cols, rows, xpixel, ypixel, args, env, true)
+    }
+
+    /// Drain and display frames, letting the test decide when to send each acknowledgement.
+    pub fn with_manual_frame_replies(
+        cols: u16,
+        rows: u16,
+        xpixel: u16,
+        ypixel: u16,
+        args: &[&str],
+    ) -> Self {
+        Self::spawn_pty(cols, rows, xpixel, ypixel, args, &[], false)
+    }
+
+    fn spawn_pty(
+        cols: u16,
+        rows: u16,
+        xpixel: u16,
+        ypixel: u16,
+        args: &[&str],
+        env: &[(&str, &str)],
+        auto_frame_replies: bool,
     ) -> Self {
         let slot = PtySlot::acquire();
         let mut master_fd = -1;
@@ -195,7 +221,7 @@ impl FakeTerm {
                 Ok(())
             });
         }
-        let child = cmd.spawn().expect("failed to start desktui");
+        let child = cmd.spawn().expect("failed to start tvnc");
 
         // Drain continuously, the way a terminal does.
         let seen = Arc::new(Mutex::new(Vec::new()));
@@ -203,12 +229,35 @@ impl FakeTerm {
         let mut reader = std::fs::File::from(master.try_clone().unwrap());
         let sink = Arc::clone(&seen);
         let done = Arc::clone(&drained);
+        let capturing = Arc::new(AtomicBool::new(false));
+        let reader_capturing = Arc::clone(&capturing);
         std::thread::spawn(move || {
             let mut chunk = [0u8; 16384];
             loop {
                 match reader.read(&mut chunk) {
                     Ok(0) | Err(_) => break, // no slave left; EIO is the usual report
-                    Ok(n) => sink.lock().unwrap().extend_from_slice(&chunk[..n]),
+                    Ok(n) => {
+                        reader_capturing.store(true, Ordering::Release);
+                        let mut output = sink.lock().unwrap();
+                        reader_capturing.store(false, Ordering::Release);
+                        let before = output.len();
+                        output.extend_from_slice(&chunk[..n]);
+                        if !auto_frame_replies {
+                            continue;
+                        }
+                        // Emulate processing the frame before answering. The
+                        // capture lock also orders subsequent clicks after
+                        // replies, and lets a test suspend the emulator here.
+                        for (query, reply) in [
+                            (LAYOUT_QUERY, b"\x1b[?62;22c".as_slice()),
+                            (GRAPHICS_LAYOUT_QUERY, b"\x1b_Gi=1895;OK\x1b\\".as_slice()),
+                        ] {
+                            let start = before.saturating_sub(query.len() - 1);
+                            for _ in 0..count(&output[start..], query) {
+                                let _ = reader.write_all(reply);
+                            }
+                        }
+                    }
                 }
             }
             done.store(true, Ordering::Release);
@@ -219,6 +268,7 @@ impl FakeTerm {
             child,
             master: std::fs::File::from(master),
             seen,
+            capturing,
             drained,
             slave: Some(slave),
         }
@@ -235,6 +285,85 @@ impl FakeTerm {
 
     pub fn output(&self) -> Vec<u8> {
         self.seen.lock().unwrap().clone()
+    }
+
+    /// Pause the emulator without filling the PTY. A single invisible byte
+    /// wakes its reader and leaves it waiting for our capture lock.
+    pub fn with_reader_paused<T>(&mut self, exercise: impl FnOnce(&mut Self) -> T) -> T {
+        let seen = Arc::clone(&self.seen);
+        let _paused = seen.lock().unwrap();
+        rustix::io::write(self.slave.as_ref().unwrap(), &[0]).unwrap();
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while !self.capturing.load(Ordering::Acquire) {
+            assert!(
+                Instant::now() < deadline,
+                "the terminal reader did not pause"
+            );
+            std::thread::yield_now();
+        }
+        exercise(self)
+    }
+
+    fn nonblocking_output(&self) -> OwnedFd {
+        use rustix::fs::{Mode, OFlags, open};
+        let tty = rustix::termios::ttyname(self.slave.as_ref().unwrap(), Vec::new()).unwrap();
+        open(
+            tty,
+            OFlags::WRONLY | OFlags::NONBLOCK | OFlags::NOCTTY,
+            Mode::empty(),
+        )
+        .unwrap()
+    }
+
+    pub fn try_write_output(&self, bytes: &[u8]) -> bool {
+        rustix::io::write(self.nonblocking_output(), bytes) == Ok(bytes.len())
+    }
+
+    #[cfg(not(target_os = "macos"))]
+    pub fn unread_bytes(&self) -> u64 {
+        rustix::io::ioctl_fionread(&self.master).unwrap()
+    }
+
+    #[cfg(target_os = "macos")]
+    pub fn unread_bytes(&self) -> u64 {
+        // Darwin's FIONREAD returns zero on a PTY master even when it is
+        // readable. EVFILT_READ reports the queued bytes without consuming them.
+        use rustix::event::kqueue::{Event, EventFilter, EventFlags, kevent, kqueue};
+        let queue = kqueue().unwrap();
+        let watch = Event::new(
+            EventFilter::Read(self.master.as_raw_fd()),
+            EventFlags::ADD,
+            std::ptr::null_mut(),
+        );
+        let mut slot = [std::mem::MaybeUninit::uninit()];
+        // SAFETY: the master outlives the local kqueue.
+        let (ready, _) =
+            unsafe { kevent(&queue, &[watch], &mut slot[..], Some(Duration::ZERO)) }.unwrap();
+        ready.first().map_or(0, |event| event.data() as u64)
+    }
+
+    /// Stop the terminal consuming frames while the child can still receive input.
+    pub fn with_output_stalled<T>(&mut self, exercise: impl FnOnce(&mut Self) -> T) -> T {
+        use rustix::io::{Errno, write};
+
+        let filler = self.nonblocking_output();
+        let seen = Arc::clone(&self.seen);
+        let _paused = seen.lock().unwrap();
+        // NUL is invisible. Once the reader is waiting for our lock and even one
+        // byte cannot fit, the viewer's next frame must block on the slave.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        let mut padding: &[u8] = &[0; 4096];
+        loop {
+            match write(&filler, padding) {
+                Ok(_) | Err(Errno::INTR) => {}
+                Err(Errno::AGAIN) if padding.len() > 1 => padding = &[0],
+                Err(Errno::AGAIN) if self.capturing.load(Ordering::Acquire) => break,
+                Err(Errno::AGAIN) => std::thread::yield_now(),
+                Err(e) => panic!("could not fill the terminal output queue: {e}"),
+            }
+            assert!(Instant::now() < deadline, "terminal output did not stall");
+        }
+        exercise(self)
     }
 
     /// Wait for `needle` to appear in everything said so far.
@@ -539,7 +668,7 @@ pub fn tail(buf: &[u8]) -> String {
     let text = String::from_utf8_lossy(buf);
     let mut lines: Vec<&str> = text
         .split('\x1b')
-        .filter(|s| s.contains("desktui") || s.contains("1:1") || s.contains("error"))
+        .filter(|s| s.contains("tvnc") || s.contains("1:1") || s.contains("error"))
         .collect();
     lines.dedup();
     let n = lines.len();

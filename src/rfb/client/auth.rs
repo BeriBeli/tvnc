@@ -130,32 +130,58 @@ impl From<AuthResult> for u32 {
     }
 }
 
+pub(crate) struct VncPassword {
+    pub bytes: Vec<u8>,
+    /// This credential came from the explicitly view-only entry of a passwd file.
+    pub view_only: bool,
+}
+
+impl From<Vec<u8>> for VncPassword {
+    fn from(bytes: Vec<u8>) -> Self {
+        Self {
+            bytes,
+            view_only: false,
+        }
+    }
+}
+
+/// Read the full-control or view-only entry written by TigerVNC's vncpasswd.
+pub(crate) fn decode_tigervnc_passwd(contents: &[u8], view_only: bool) -> Option<VncPassword> {
+    let (entry, view_only) = match contents.len() {
+        8 => (contents, false),
+        16 if view_only => (&contents[8..], true),
+        16 => (&contents[..8], false),
+        _ => return None,
+    };
+    // TigerVNC's d3des numbers bits within each key byte in the opposite order
+    // to standard DES, both for the fixed file key and for VNC authentication.
+    let file_key = [23u8, 82, 107, 6, 35, 78, 88, 7].map(u8::reverse_bits);
+    let mut password = security::des::decrypt(entry, &file_key);
+    if let Some(end) = password.iter().position(|&b| b == 0) {
+        password.truncate(end);
+    }
+    Some(VncPassword {
+        bytes: password,
+        view_only,
+    })
+}
+
 pub(super) struct AuthHelper {
     challenge: [u8; 16],
     key: [u8; 8],
 }
 
 impl AuthHelper {
-    pub(super) async fn read<S>(reader: &mut S, credential: &str) -> Result<Self, VncError>
+    pub(super) async fn read<S>(reader: &mut S, credential: &[u8]) -> Result<Self, VncError>
     where
         S: AsyncRead + Unpin,
     {
         let mut challenge = [0; 16];
         reader.read_exact(&mut challenge).await?;
 
-        let credential_len = credential.len();
         let mut key = [0u8; 8];
-        for (i, key_i) in key.iter_mut().enumerate() {
-            let c = if i < credential_len {
-                credential.as_bytes()[i]
-            } else {
-                0
-            };
-            let mut cs = 0u8;
-            for j in 0..8 {
-                cs |= ((c >> j) & 1) << (7 - j)
-            }
-            *key_i = cs;
+        for (key_byte, &password_byte) in key.iter_mut().zip(credential) {
+            *key_byte = password_byte.reverse_bits();
         }
 
         Ok(Self { challenge, key })
@@ -182,6 +208,37 @@ impl AuthHelper {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn reads_full_control_and_view_only_tigervnc_passwords() {
+        // TigerVNC 1.13.1 vncpasswd -f output, including a non-UTF-8 password.
+        let file = [
+            0x6e, 0x09, 0x7a, 0x8e, 0x12, 0x69, 0x58, 0xd8, 0xf6, 0xda, 0xc8, 0xd0, 0x2c, 0xad,
+            0x5c, 0x60,
+        ];
+        let full = decode_tigervnc_passwd(&file, false).unwrap();
+        let watch = decode_tigervnc_passwd(&file, true).unwrap();
+        let single = decode_tigervnc_passwd(&file[..8], true).unwrap();
+        assert_eq!(full.bytes, b"tui\xe9demo");
+        assert_eq!(watch.bytes, b"watch42");
+        assert_eq!(single.bytes, full.bytes);
+        assert!(watch.view_only && !full.view_only && !single.view_only);
+    }
+
+    #[test]
+    fn decodes_tigervnc_files_even_when_the_bytes_are_printable() {
+        assert_eq!(
+            decode_tigervnc_passwd(b".7CXJTFb", false).unwrap().bytes,
+            b"case2396"
+        );
+    }
+
+    #[test]
+    fn rejects_incomplete_or_extra_tigervnc_entries() {
+        for length in [0, 7, 9, 15, 17] {
+            assert!(decode_tigervnc_passwd(&vec![0xff; length], false).is_none());
+        }
+    }
 
     // ------------------------------------------------------- the security type
 
@@ -328,7 +385,7 @@ mod tests {
         // key. It is not a hash and not an accident of endianness: get it wrong and
         // every password is silently rejected by every server.
         let challenge = [7u8; 16];
-        let helper = AuthHelper::read(&mut &challenge[..], "ab").await.unwrap();
+        let helper = AuthHelper::read(&mut &challenge[..], b"ab").await.unwrap();
 
         assert_eq!(helper.challenge, challenge);
         assert_eq!(helper.key[0], reversed(b'a'));
@@ -342,10 +399,10 @@ mod tests {
         // password is truncated rather than folded in. Worth pinning: a user whose
         // password differs only past the eighth character would otherwise be baffled.
         let challenge = [0u8; 16];
-        let short = AuthHelper::read(&mut &challenge[..], "12345678")
+        let short = AuthHelper::read(&mut &challenge[..], b"12345678")
             .await
             .unwrap();
-        let long = AuthHelper::read(&mut &challenge[..], "12345678ignored")
+        let long = AuthHelper::read(&mut &challenge[..], b"12345678ignored")
             .await
             .unwrap();
 
@@ -359,7 +416,7 @@ mod tests {
         let challenge = [0x5au8; 16];
 
         let mut first = Vec::new();
-        AuthHelper::read(&mut &challenge[..], "secret")
+        AuthHelper::read(&mut &challenge[..], b"secret")
             .await
             .unwrap()
             .write(&mut first)
@@ -367,7 +424,7 @@ mod tests {
             .unwrap();
 
         let mut second = Vec::new();
-        AuthHelper::read(&mut &challenge[..], "secres")
+        AuthHelper::read(&mut &challenge[..], b"secres")
             .await
             .unwrap()
             .write(&mut second)
@@ -383,7 +440,7 @@ mod tests {
         let challenge = [0u8; 16];
 
         for (word, accepted) in [(0u32, true), (1, false)] {
-            let helper = AuthHelper::read(&mut &challenge[..], "pw").await.unwrap();
+            let helper = AuthHelper::read(&mut &challenge[..], b"pw").await.unwrap();
             let reply = word.to_be_bytes();
             let mut stream = tokio::io::join(&reply[..], Vec::new());
             let result = helper.finish(&mut stream).await.unwrap();

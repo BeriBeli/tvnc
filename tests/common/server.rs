@@ -86,6 +86,8 @@ pub enum Request {
 /// Extensions the fake server offers, beyond the resize behaviour.
 #[derive(Debug, Clone, Copy, Default)]
 pub struct Extensions {
+    /// Offer VNC authentication and check the reply to challenge bytes 0..16.
+    pub auth_response: Option<[u8; 16]>,
     /// Answer `SetEncodings` with `EndOfContinuousUpdates`, which is how a server
     /// says the extension exists, then push frames without being asked.
     pub continuous_updates: bool,
@@ -121,7 +123,7 @@ pub struct Extensions {
 /// deadline, and a test cannot tell a seam the client was entitled to from the bug of
 /// drawing one it was not -- what reaches the terminal says which rectangles a frame
 /// carried, never how long the client had waited. So the deadline is set explicitly by the
-/// tests that care, through `DESKTUI_MAX_PARTIAL_WAIT_MS`: out of reach for the one that
+/// tests that care, through `TVNC_MAX_PARTIAL_WAIT_MS`: out of reach for the one that
 /// means to prove the waiting, and far under this stall for the one that means to prove the
 /// deadline still fires.
 pub const SPLIT_STALL: Duration = Duration::from_millis(100);
@@ -233,14 +235,24 @@ fn serve(
     let mut version = [0u8; 12];
     stream.read_exact(&mut version)?;
 
-    // Security: offer only None, then report success.
-    stream.write_all(&[1, 1])?;
+    let security = if extensions.auth_response.is_some() {
+        2
+    } else {
+        1
+    };
+    stream.write_all(&[1, security])?;
     let mut chosen = [0u8; 1];
     stream.read_exact(&mut chosen)?;
     assert_eq!(
-        chosen[0], 1,
+        chosen[0], security,
         "client picked a security type we did not offer"
     );
+    if let Some(expected) = extensions.auth_response {
+        stream.write_all(&std::array::from_fn::<_, 16, _>(|i| i as u8))?;
+        let mut response = [0; 16];
+        stream.read_exact(&mut response)?;
+        assert_eq!(response, expected, "client used the wrong password entry");
+    }
     stream.write_all(&0u32.to_be_bytes())?;
 
     // ClientInit, then ServerInit.
@@ -604,19 +616,15 @@ fn clipboard_provide(text: &str) -> Vec<u8> {
     let mut payload = text.replace('\n', "\r\n").into_bytes();
     payload.push(0);
 
-    let mut deflated = Vec::new();
-    {
-        let mut encoder =
-            flate2::write::ZlibEncoder::new(&mut deflated, flate2::Compression::new(6));
-        encoder
-            .write_all(&(payload.len() as u32).to_be_bytes())
-            .unwrap();
-        encoder.write_all(&payload).unwrap();
-        encoder.finish().unwrap();
-    }
-
+    let mut encoder = flate2::write::ZlibEncoder::new(Vec::new(), flate2::Compression::new(6));
+    encoder
+        .write_all(&(payload.len() as u32).to_be_bytes())
+        .unwrap();
+    encoder.write_all(&payload).unwrap();
+    // TigerVNC sends the bytes available after a sync flush, before finishing zlib.
+    encoder.flush().unwrap();
     let mut body = (clip::PROVIDE | clip::TEXT).to_be_bytes().to_vec();
-    body.extend_from_slice(&deflated);
+    body.extend_from_slice(encoder.get_ref());
     body
 }
 

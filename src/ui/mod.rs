@@ -1,13 +1,8 @@
 //! Chrome drawn around the remote screen.
 //!
-//! Laid out by ratatui, but the screen is never handed to it: a cell-diffing
-//! renderer that owned the terminal would have opinions about the cells our graphics
-//! placements live in. Each piece renders into a buffer of exactly its own size and
-//! `paint` writes that out, so the widgets do the padding, alignment and styling
-//! without reaching a single cell they were not given.
-//!
-//! Text is legible over the image because placements use `z=-1`, which puts them
-//! below text and above the cell background.
+//! Ratatui widgets share a cell buffer for the status line, menu and notifications.
+//! Their explicit background colours cover the desktop tiles underneath. The diff
+//! writes only the cells that changed.
 
 pub mod chrome;
 pub mod menu;

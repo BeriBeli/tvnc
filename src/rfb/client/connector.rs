@@ -9,20 +9,17 @@ use tracing::{info, trace};
 
 use crate::rfb::{PixelFormat, VncEncoding, VncError, VncVersion};
 
-pub enum VncState<S, F>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
-    F: Future<Output = Result<String, VncError>> + Send + Sync + 'static,
-{
+pub enum VncState<S, F> {
     Handshake(VncConnector<S, F>),
     Authenticate(VncConnector<S, F>),
     Connected(VncClient),
 }
 
-impl<S, F> VncState<S, F>
+impl<S, F, P> VncState<S, F>
 where
     S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
-    F: Future<Output = Result<String, VncError>> + Send + Sync + 'static,
+    F: Future<Output = Result<P, VncError>> + Send + Sync + 'static,
+    P: AsRef<[u8]> + Send + Sync + 'static,
 {
     pub fn try_start(
         self,
@@ -54,7 +51,8 @@ where
 
                     assert!(!security_types.is_empty());
 
-                    if security_types.contains(&SecurityType::None) {
+                    let no_auth = security_types.contains(&SecurityType::None);
+                    if no_auth {
                         match connector.rfb_version {
                             VncVersion::RFB33 => {
                                 // If the security-type is 1, for no authentication, the server does not
@@ -111,7 +109,8 @@ where
                         let credential = (connector.auth_methond.take().unwrap()).await?;
 
                         // auth
-                        let auth = AuthHelper::read(&mut connector.stream, &credential).await?;
+                        let auth =
+                            AuthHelper::read(&mut connector.stream, credential.as_ref()).await?;
                         auth.write(&mut connector.stream).await?;
                         let result = auth.finish(&mut connector.stream).await?;
                         if let AuthResult::Failed = result {
@@ -137,6 +136,7 @@ where
                             connector.encodings,
                             connector.quality,
                             connector.compression,
+                            !no_auth,
                         )
                         .await?,
                     ))
@@ -156,11 +156,7 @@ where
 }
 
 /// Connection Builder to setup a vnc client
-pub struct VncConnector<S, F>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + 'static,
-    F: Future<Output = Result<String, VncError>> + Send + Sync + 'static,
-{
+pub struct VncConnector<S, F> {
     stream: S,
     auth_methond: Option<F>,
     rfb_version: VncVersion,
@@ -171,11 +167,7 @@ where
     compression: Option<u8>,
 }
 
-impl<S, F> VncConnector<S, F>
-where
-    S: AsyncRead + AsyncWrite + Unpin + Send + Sync + 'static,
-    F: Future<Output = Result<String, VncError>> + Send + Sync + 'static,
-{
+impl<S, F> VncConnector<S, F> {
     /// To new a vnc client configuration with stream `S`
     ///
     /// `S` should implement async I/O methods

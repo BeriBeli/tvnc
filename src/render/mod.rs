@@ -136,14 +136,14 @@ impl Layout {
         // does, or when it refuses, it behaves as a 1:1 window.
         let one_to_one = matches!(mode, ScaleMode::Native | ScaleMode::OneToOne);
 
-        let (src, dst_w, dst_h, scale) = if one_to_one {
+        let (src, dst_w, dst_h, scale) = if area_w == 0 || area_h == 0 || src_w == 0 || src_h == 0 {
+            (Rect::new(0, 0, 0, 0), 0, 0, 1.0)
+        } else if one_to_one {
             let vis_w = src_w.min(area_w);
             let vis_h = src_h.min(area_h);
             let x = pan.0.min(src_w - vis_w);
             let y = pan.1.min(src_h - vis_h);
             (Rect::new(x, y, vis_w, vis_h), vis_w, vis_h, 1.0)
-        } else if src_w == 0 || src_h == 0 {
-            (Rect::new(0, 0, 0, 0), 0, 0, 1.0)
         } else {
             let fit =
                 (f64::from(area_w) / f64::from(src_w)).min(f64::from(area_h) / f64::from(src_h));
@@ -769,9 +769,7 @@ impl Renderer {
 
     /// Draw, move or hide the pointer, whichever it is owed.
     ///
-    /// Called after the tiles so it lands on top of them. Its id is above every tile's, so
-    /// the terminal composites it there regardless of order, but keeping the order honest
-    /// costs nothing.
+    /// The pointer's z-index keeps it above the desktop and menu backgrounds.
     fn compose_cursor(&mut self, out: &mut Vec<u8>) {
         if !self.cursor_owing {
             return;
@@ -980,9 +978,6 @@ impl Renderer {
             }
         }
 
-        // After the tiles, so the pointer is written over the picture it sits on. Its id is
-        // above every tile's, so the terminal would composite it there whatever the order,
-        // but a frame that reads in the order it draws is easier to follow.
         self.compose_cursor(out);
 
         stats.bytes = out.len() - before;
@@ -1037,6 +1032,21 @@ mod tests {
     fn image_area_excludes_the_status_row() {
         let m = ghostty();
         assert_eq!(m.image_area(), (1600, 49 * 17));
+    }
+
+    #[test]
+    fn every_scale_mode_leaves_the_only_row_to_the_footer() {
+        let m = metrics(40, 1, 8, 16);
+        for mode in [
+            ScaleMode::Native,
+            ScaleMode::Fit,
+            ScaleMode::Integer,
+            ScaleMode::OneToOne,
+        ] {
+            let l = Layout::compute(&m, mode, 800, 600, (0, 0));
+            assert_eq!((l.dst_w, l.dst_h), (0, 0));
+            assert_eq!(l.terminal_px_to_src(0, 0), None);
+        }
     }
 
     #[test]

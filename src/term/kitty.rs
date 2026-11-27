@@ -26,9 +26,8 @@
 //! * `q=2` suppresses both success and error replies. Without it the terminal
 //!   would answer every tile and we would have to drain those answers out of
 //!   the input stream.
-//! * `z=-1` puts the image below text but above the cell background, so the
-//!   status line and the command menu stay legible on top of the remote screen.
-//!   At the default `z=0` the image would cover them.
+//! * Desktop tiles sit below explicit cell backgrounds. The menu can cover a
+//!   moving desktop by painting its cells, including the blank padding.
 //!
 //! Animation frames (`a=f`) are deliberately unused: they exist for
 //! terminal-paced playback of frames known ahead of time, and Ghostty does not
@@ -51,10 +50,14 @@ const ZLIB_LEVEL: Compression = Compression::new(1);
 
 /// First image id we use, well away from the low ids other programs tend to pick.
 ///
-/// A tile takes `IMAGE_ID_BASE` plus an offset for where it sits in the grid, which
-/// `render::TileGrid` works out. Its stride is what the distance to
-/// [`OVERLAY_IMAGE_ID`] has to clear.
+/// A tile takes `IMAGE_ID_BASE` plus its offset in the tile grid.
 pub const IMAGE_ID_BASE: u32 = 0x7600;
+
+/// Kitty draws placements below INT32_MIN / 2 behind explicit cell backgrounds.
+/// Cells with the default background still show the remote desktop.
+const DESKTOP_Z: i32 = i32::MIN / 2 - 1;
+/// The pointer stays above menu backgrounds and below text.
+const CURSOR_Z: i32 = -1;
 
 /// Placement id carried by every image we place.
 ///
@@ -64,31 +67,8 @@ pub const IMAGE_ID_BASE: u32 = 0x7600;
 /// asking for an additional placement instead of a replacement.
 const PLACEMENT_ID: u32 = 1;
 
-/// Image id for an overlay's backdrop, above every id a tile can take.
-///
-/// The distance is the point: at equal z-index the higher id is composited on
-/// top, which is the only way an overlay can cover the remote screen. A cell
-/// background cannot, being painted below the image.
-///
-/// A tile is addressed by its place in the grid rather than by a running count, so
-/// what has to be cleared is the whole coordinate space and not the number of tiles
-/// on screen -- `render::TILE_ID_STRIDE` squared, which this is comfortably past.
-pub const OVERLAY_IMAGE_ID: u32 = IMAGE_ID_BASE + 0x40000;
-
-/// Image id for the menu row under the pointer, one above the backdrop it is drawn
-/// on so it is composited over it rather than under.
-pub const MENU_HIGHLIGHT_IMAGE_ID: u32 = OVERLAY_IMAGE_ID + 1;
-
-/// Image id for the notification popup's backdrop, above both of the menu's: a note
-/// that arrives while the menu is open belongs on top of it, not under it.
-pub const TOAST_IMAGE_ID: u32 = MENU_HIGHLIGHT_IMAGE_ID + 1;
-
-/// Image id for the mouse pointer, above everything.
-///
-/// It is what you are aiming with, so nothing should be able to cover it -- including the
-/// menu, whose items are clicked with it. Blended into the tiles, as it used to be, it
-/// went under the menu's backdrop and could not be seen while the menu was open.
-pub const CURSOR_IMAGE_ID: u32 = TOAST_IMAGE_ID + 1;
+/// A distinct image id beyond the tile grid's 512 × 512 coordinates.
+pub const CURSOR_IMAGE_ID: u32 = IMAGE_ID_BASE + 0x40000;
 
 /// Where a tile goes and how big it is.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
@@ -162,8 +142,10 @@ impl KittyEncoder {
         let first = chunks.next().unwrap_or(b"");
         let mut remaining = bytes.len().saturating_sub(first.len());
 
-        out.extend_from_slice(b"\x1b_Ga=T,q=2,C=1,z=-1,f=24,i=");
-        let _ = write!(out, "{id},p={PLACEMENT_ID},s={w},v={h}");
+        let _ = write!(
+            out,
+            "\x1b_Ga=T,q=2,C=1,z={DESKTOP_Z},f=24,i={id},p={PLACEMENT_ID},s={w},v={h}"
+        );
         if *compress {
             out.extend_from_slice(b",o=z");
         }
@@ -209,7 +191,7 @@ impl KittyEncoder {
         BASE64.encode_string(name.as_bytes(), &mut self.b64);
         let _ = write!(
             out,
-            "\x1b_Ga=T,q=2,C=1,z=-1,f=24,t=s,i={id},p={PLACEMENT_ID},s={w},v={h};"
+            "\x1b_Ga=T,q=2,C=1,z={DESKTOP_Z},f=24,t=s,i={id},p={PLACEMENT_ID},s={w},v={h};"
         );
         out.extend_from_slice(self.b64.as_bytes());
         out.extend_from_slice(b"\x1b\\");
@@ -246,9 +228,7 @@ pub struct At {
 /// Transmit `rgba` and place it, keeping its alpha.
 ///
 /// `f=32` rather than the tiles' `f=24`, because this is for the pointer, whose shape is a
-/// mask: the alpha decides what of the picture underneath shows through. Overlapping
-/// placements blend, and at equal `z` the higher id is on top, which is why the pointer's
-/// id is the highest of ours.
+/// mask. Its alpha lets the desktop or menu under the pointer show through.
 ///
 /// Not compressed. A pointer is a few kilobytes and is sent once per shape, where zlib
 /// costs a pass over it every time.
@@ -270,7 +250,7 @@ pub fn place_rgba(out: &mut Vec<u8>, id: u32, at: At, w: u32, h: u32, rgba: &[u8
 
     let _ = write!(
         out,
-        "\x1b_Ga=T,q=2,C=1,z=-1,f=32,i={id},p={PLACEMENT_ID},s={w},v={h},X={},Y={}",
+        "\x1b_Ga=T,q=2,C=1,z={CURSOR_Z},f=32,i={id},p={PLACEMENT_ID},s={w},v={h},X={},Y={}",
         at.x, at.y
     );
     if remaining > 0 {
@@ -294,7 +274,7 @@ pub fn place_existing_at(out: &mut Vec<u8>, id: u32, at: At) {
     let _ = write!(out, "\x1b[{};{}H", at.row as u32 + 1, at.col as u32 + 1);
     let _ = write!(
         out,
-        "\x1b_Ga=p,q=2,C=1,z=-1,i={id},p={PLACEMENT_ID},X={},Y={}\x1b\\",
+        "\x1b_Ga=p,q=2,C=1,z={CURSOR_Z},i={id},p={PLACEMENT_ID},X={},Y={}\x1b\\",
         at.x, at.y
     );
 }
@@ -323,46 +303,10 @@ pub fn hide_image(out: &mut Vec<u8>, id: u32) {
 pub fn place_existing(out: &mut Vec<u8>, id: u32, col: u16, row: u16) {
     release_placement(out, id);
     let _ = write!(out, "\x1b[{};{}H", row as u32 + 1, col as u32 + 1);
-    let _ = write!(out, "\x1b_Ga=p,q=2,C=1,z=-1,i={id},p={PLACEMENT_ID}\x1b\\");
-}
-
-/// Fill a block of cells with one colour, as an image at the tiles' own z-index.
-///
-/// An overlay cannot be given a background with SGR: the remote screen is
-/// composited above the cell background, so a colour set there is never seen and
-/// only the glyphs come out on top. An image of our own, at the same `z=-1` but a
-/// higher id than any tile, is drawn over them instead -- and the text still lands
-/// on top of that.
-///
-/// The source is two pixels square, stretched across the block with `c`/`r`, so
-/// the payload is four pixels however large the box is. `col` and `row` are
-/// one-based, as the cursor is.
-pub fn place_solid(
-    out: &mut Vec<u8>,
-    id: u32,
-    col: usize,
-    row: usize,
-    cols: usize,
-    rows: usize,
-    rgb: (u8, u8, u8),
-) {
-    if cols == 0 || rows == 0 {
-        return;
-    }
-    let pixels = [rgb.0, rgb.1, rgb.2].repeat(4);
-    let mut b64 = String::new();
-    BASE64.encode_string(&pixels, &mut b64);
-
-    // The overlay is redrawn every frame it is up, so it accumulates placements
-    // exactly as a tile would without this.
-    release_placement(out, id);
-    let _ = write!(out, "\x1b[{row};{col}H");
     let _ = write!(
         out,
-        "\x1b_Ga=T,q=2,C=1,z=-1,f=24,i={id},p={PLACEMENT_ID},s=2,v=2,c={cols},r={rows};"
+        "\x1b_Ga=p,q=2,C=1,z={DESKTOP_Z},i={id},p={PLACEMENT_ID}\x1b\\"
     );
-    out.extend_from_slice(b64.as_bytes());
-    out.extend_from_slice(b"\x1b\\");
 }
 
 /// Remove one image and free the data behind it.
@@ -441,8 +385,7 @@ mod tests {
         assert!(keys.contains("f=24"), "{keys}");
         assert!(keys.contains("C=1"), "{keys}");
         assert!(keys.contains("q=2"), "{keys}");
-        // Below text, so overlays remain readable over the remote screen.
-        assert!(keys.contains("z=-1"), "{keys}");
+        assert!(keys.contains(&format!(",z={DESKTOP_Z},")), "{keys}");
         assert!(keys.contains("s=4,v=1"), "{keys}");
         assert!(
             !keys.contains("m="),
@@ -471,23 +414,44 @@ mod tests {
     /// tile of every frame left one behind. Ghostty rebuilds its whole placement
     /// list each frame, so a session's cost grew with its age until it crawled.
     #[test]
-    fn every_placement_pins_its_placement_id() {
+    fn every_placement_pins_its_id_and_stays_on_its_layer() {
         let mut enc = KittyEncoder::new(true);
         let mut out = Vec::new();
-        enc.place_rgb(&mut out, place(IMAGE_ID_BASE, 0, 0, 2, 2), &[7; 2 * 2 * 3]);
-        enc.place_shm(&mut out, place(IMAGE_ID_BASE + 1, 0, 0, 2, 2), "/vt1-2");
-        place_solid(&mut out, OVERLAY_IMAGE_ID, 1, 1, 4, 2, (0, 0, 0));
+        let tile = place(IMAGE_ID_BASE, 0, 0, 2, 2);
+        enc.place_rgb(&mut out, tile, &[7; 12]);
+        enc.place_shm(&mut out, tile, "/vt1-2");
+        place_existing(&mut out, tile.id, 1, 1);
+        place_rgba(&mut out, CURSOR_IMAGE_ID, At::default(), 2, 2, &[7; 16]);
+        place_existing_at(&mut out, CURSOR_IMAGE_ID, At::default());
 
-        let transmits: Vec<_> = commands(&out)
+        let placements: Vec<_> = commands(&out)
             .into_iter()
-            .filter(|keys| keys.contains("a=T"))
+            .filter(|keys| keys.starts_with("a=T,") || keys.starts_with("a=p,"))
             .collect();
-        assert_eq!(transmits.len(), 3, "{transmits:?}");
-        for keys in transmits {
+        assert_eq!(placements.len(), 5);
+        for keys in placements {
+            let params: Vec<_> = keys.split(',').collect();
             assert!(
-                keys.contains(&format!("p={PLACEMENT_ID}")),
-                "a placement without p= accumulates in the terminal: {keys}"
+                params.contains(&format!("p={PLACEMENT_ID}").as_str()),
+                "{keys}"
             );
+            let z: i32 = params
+                .iter()
+                .find_map(|k| k.strip_prefix("z="))
+                .unwrap()
+                .parse()
+                .unwrap();
+            if params.contains(&format!("i={}", tile.id).as_str()) {
+                assert!(
+                    z < i32::MIN / 2,
+                    "desktop obscures cell backgrounds: {keys}"
+                );
+            } else {
+                assert!(
+                    (i32::MIN / 2..0).contains(&z),
+                    "pointer must be between backgrounds and text: {keys}"
+                );
+            }
         }
     }
 

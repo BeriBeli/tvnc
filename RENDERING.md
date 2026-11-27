@@ -21,8 +21,8 @@ Every design decision below follows from one of these.
 | the same image id *and* placement id replaces a placement, "without flicker" | a picture that only moved costs a placement each and no pixels |
 | `a=p` displays an image the terminal already holds, with no payload | ditto, in about forty bytes |
 | `a=d,d=I` frees one image and its placements | a tile the grid no longer reaches is dropped by name, not by erasing the screen |
-| at equal `z`, the higher image id composites above | the cursor and the overlay backdrops sit above the picture without a second z-layer |
-| `z=-1` is below text and above the cell background | the status line and the menu stay legible over the picture, and a blank cell does not hide it |
+| placements with `z < -1073741824` are below explicit cell backgrounds | desktop tiles show through default cells, and coloured cells cover them |
+| `z=-1` is below text and above cell backgrounds | the pointer stays visible over the menu |
 | `t=s` takes `O=` and `S=`, an offset and a length | nothing, as it turns out: the terminal unlinks an object once it has read it, so it is an object per tile -- see [the finding](#the-o-finding) |
 | DEC 2026 brackets an atomic update | a frame is one write, and the screen never shows half of one |
 | `Fence` synchronises, and `EnableContinuousUpdates` takes a flag | the server's pushing can be turned off and on rather than only declined, and encode time can be told from wire time |
@@ -82,7 +82,7 @@ elsewhere between updates drew the seam on one that had arrived perfectly prompt
 The deadline is what makes this hard to test rather than hard to build. Nothing that reaches
 the terminal distinguishes a seam the client was entitled to draw from the bug of drawing
 one it was not, and a loaded machine crosses any wall-clock deadline eventually -- so
-`DESKTUI_MAX_PARTIAL_WAIT_MS` lets a test put the deadline out of reach, or bring it well
+`TVNC_MAX_PARTIAL_WAIT_MS` lets a test put the deadline out of reach, or bring it well
 within, and each half of the rule gets a test that can only fail for one reason.
 
 ### Map
@@ -188,9 +188,10 @@ A cell-diffing renderer that owned the whole screen would be wrong here: it woul
 cells our placements live in, and those are not its to repaint. Owning one plane and
 diffing that is the same idea with the boundary in the right place.
 
-Overlay backdrops -- the menu's, a notification's -- are images of ours with ids above
-every tile. A cell background cannot serve: it is painted *below* the picture, so a colour
-set there is never seen.
+The menu and notification set a background colour on every cell in their bounds.
+Desktop tiles use the same below-background z-index for direct transmission, shared
+memory and placement-only moves. Closing a panel restores the default cell background.
+See the [Kitty placement rules](https://sw.kovidgoyal.net/kitty/graphics-protocol/#controlling-displayed-image-layout).
 
 ### Cursor
 
@@ -241,7 +242,7 @@ Tiles sent, moved and dropped per frame; bytes and system calls per frame; resam
 and emit in milliseconds. And the other half, which is the half that decides whether any of
 the rest is worth touching: what the *server* is doing.
 
-`Ctrl+A c` reports both. Ours is the frame rate, tiles and bytes; theirs is three numbers
+`c` in the `F8` menu reports both. Ours is the frame rate, tiles and bytes; theirs is three numbers
 that fall out of the update boundary `mid_update` already tracks -- **updates per second**,
 which with frames being pushed *is* the server's frame rate; **delivery time**, from an
 update's first rectangle to its `FrameEnd`; and **picture per update** in megapixels, which
@@ -364,8 +365,8 @@ one object, transmit it once with `a=t` -- one read, one unlink, five system cal
 then place each tile with `a=p` and a source rectangle (`x=`/`y=`/`w=`/`h=`) out of the
 stored image. What that costs, and why it is not free: a tile's image id is how the grid
 addresses it today, and this makes the frame the unit instead, so the `a=d,d=i` release
-before each placement, the id-per-tile scheme in `TileGrid` and the z-order the cursor and
-the overlays rely on all have to be reworked -- and an image store that grows a frame at a
+before each placement and the id-per-tile scheme in `TileGrid` have to change.
+The atlas placements would still use the desktop z-index. An image store that grows a frame at a
 time needs its own deletes, which is the shape of leak this protocol has already produced
 once (see the `a=d,d=i` note in `src/term/kitty.rs`).
 

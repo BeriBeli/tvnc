@@ -71,10 +71,15 @@ impl FpsMeter {
 }
 
 /// Render the synthetic test pattern until the user quits.
-pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Result<()> {
+pub fn run_test_pattern(
+    args: &Args,
+    caps: &Caps,
+    guard: &TerminalGuard,
+    metrics: Metrics,
+) -> Result<()> {
     guard.begin_full_screen()?;
 
-    let mut metrics = Metrics::query()?;
+    let mut metrics = metrics.refreshed()?;
     let mut writer = FrameWriter::spawn();
 
     // The pattern is generated at exactly the size of the image area, so the
@@ -91,9 +96,8 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
     );
     let mut damage: Vec<Rect> = Vec::new();
     let mut fps = FpsMeter::new();
-    // Listed, not clickable: none of the prefix commands mean anything to a loop
-    // with no server behind it, and nothing here can change what it shows either.
-    let menu = Menu::new(args.prefix_char());
+    // The test pattern displays the session's menu as a shortcut reference.
+    let menu = Menu::new(args.menu_key);
     let state = menu::State {
         mode: args.scale,
         theme: Theme::Dark,
@@ -109,20 +113,22 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
     let mut pending_cleanup: Vec<u8> = Vec::new();
     let mut last_stats = crate::render::FrameStats::default();
     let mut dropped: u64 = 0;
-
+    let mut focused = true;
     let frame_time = Duration::from_micros(1_000_000 / u64::from(args.fps));
     let mut next_frame = Instant::now();
 
     loop {
         // Drain input without blocking past the next frame deadline.
         loop {
+            writer.flush_controls(focused)?;
             let now = Instant::now();
             let wait = next_frame.saturating_duration_since(now);
             if !event::poll(wait)? {
                 break;
             }
             match event::read()? {
-                Event::Key(key) if key.kind != KeyEventKind::Release => {
+                Event::Key(key) if key.kind == KeyEventKind::Press => {
+                    focused = true;
                     match key.code {
                         // Escape belongs to the menu while it is up, which is what the
                         // menu's own title offers. Leaving it as the way out of the
@@ -140,6 +146,9 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     }
                 }
                 Event::Mouse(m) => {
+                    if !focused {
+                        continue;
+                    }
                     // With mode 1016 in force these are pixel coordinates; when
                     // the terminal does not support it they are cells, so scale
                     // to the middle of the cell.
@@ -167,7 +176,7 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     }
                 }
                 Event::Resize(_, _) => {
-                    metrics = Metrics::query()?;
+                    metrics = metrics.refreshed()?;
                     let (w, h) = metrics.image_area();
                     area_w = w;
                     area_h = h;
@@ -181,6 +190,13 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
                     // relayout names the tiles it has dropped, and a second one before
                     // that frame goes out names different ones.
                     pending_cleanup.extend_from_slice(&cleanup);
+                }
+                Event::FocusLost => {
+                    focused = false;
+                    pattern.set_cursor(None);
+                }
+                Event::FocusGained => {
+                    focused = true;
                 }
                 _ => {}
             }
@@ -241,9 +257,10 @@ pub fn run_test_pattern(args: &Args, caps: &Caps, guard: &TerminalGuard) -> Resu
             ink,
             vec![ink.bright(" test-pattern"), ink.text(&rest)],
             vec![ink.text(&figures), ink.bright("h"), ink.text(" menu ")],
+            vec![],
         );
         if show_menu {
-            menu.render(&mut chrome, &mut buf, &metrics, state);
+            menu.render(chrome.buffer(), &metrics, state);
         }
         menu_shown = show_menu;
         for cells in chrome.flush(&mut buf) {

@@ -8,12 +8,10 @@
 //! with is settled by the capability probe rather than guessed at from traffic.
 //!
 //! **Never release what was not pressed.** Every release is checked against the
-//! set of keys we actually sent a press for. Without that, swallowing a key
-//! locally -- which the prefix does -- would leak a release for a key the server
-//! never saw pressed, and a stuck modifier on the remote is a miserable thing to
-//! debug.
+//! set of keys we actually sent a press for. This keeps local menu actions
+//! from sending stray releases to the server.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::time::{Duration, Instant};
 
 use crossterm::event::{
@@ -22,9 +20,10 @@ use crossterm::event::{
 };
 
 use super::Metrics;
-use super::keysym::{bitmask, keysym};
-use crate::cli::ScaleMode;
-use crate::remote::{Key, Pointer};
+use super::events::KeyAlternates;
+use super::keysym::{bitmask, keysym, keysym_for_char};
+use crate::cli::{MenuKey, ScaleMode};
+use crate::remote::{Input, Key, Pointer};
 use crate::render::Layout;
 use crate::ui::theme::Theme;
 
@@ -48,7 +47,7 @@ mod button {
     pub const WHEEL_RIGHT: u8 = 1 << 6;
 }
 
-/// A local command, reached through the prefix key or by pointing at the menu.
+/// A local viewer action.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub enum Command {
     Quit,
@@ -68,8 +67,8 @@ pub enum Command {
     /// Wear a palette. No key reaches this either: it is a choice rather than a step,
     /// so the menu offers the two side by side and a click names one.
     Theme(Theme),
-    /// The prefix was pressed twice: send it through to the server.
-    SendPrefix,
+    /// Tap the reserved menu key on the remote, by explicit request.
+    SendF8,
 }
 
 /// The local lock-key state, as far as the terminal will say.
@@ -83,29 +82,36 @@ pub struct LockState {
     pub num: Option<bool>,
 }
 
-/// What a key event turned into.
-#[derive(Debug, Clone, PartialEq)]
-pub enum KeyOutcome {
-    /// Nothing to do: swallowed, or unmapped.
-    Ignored,
-    /// Send these to the server, in order.
-    Keys(Vec<Key>),
-    /// Handle this locally.
-    Local(Command),
+#[derive(Clone, Copy)]
+struct PressedKey {
+    keysym: u32,
+    /// A repeat can omit the alternate that was present on the original press.
+    alternates: KeyAlternates,
+}
+
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub enum InputFocus {
+    Remote,
+    Menu,
+    ViewOnly,
 }
 
 pub struct InputMapper {
-    prefix: char,
+    menu_key: MenuKey,
     /// The terminal reports key releases, so we must not invent them.
     expect_releases: bool,
     /// Pointer positions arrive in pixels rather than cell coordinates.
     pixel_mouse: bool,
-    armed: bool,
     /// Keysyms currently pressed as far as the server is concerned.
     held: HashSet<u32>,
-    /// Modifier state we have synthesised, for terminals that only report a
-    /// bitmask.
+    /// The last keysym sent for each non-modifier key, indexed by its base
+    /// keysym and whether it belongs to the keypad.
+    pressed_keys: HashMap<(u32, bool), PressedKey>,
+    /// Modifiers inferred from a chord that lacked a separate modifier press.
     synthesised: KeyModifiers,
+    /// Modifiers for which this terminal reports physical transitions, even
+    /// if the press of the current chord happened before focus returned.
+    reported_modifiers: KeyModifiers,
     /// Pointer buttons currently down.
     buttons: u8,
     /// Last position sent, to drop duplicate motion.
@@ -117,14 +123,15 @@ pub struct InputMapper {
 }
 
 impl InputMapper {
-    pub fn new(prefix: char, expect_releases: bool, pixel_mouse: bool) -> Self {
+    pub fn new(menu_key: MenuKey, expect_releases: bool, pixel_mouse: bool) -> Self {
         Self {
-            prefix: prefix.to_ascii_lowercase(),
+            menu_key,
             expect_releases,
             pixel_mouse,
-            armed: false,
             held: HashSet::new(),
+            pressed_keys: HashMap::new(),
             synthesised: KeyModifiers::NONE,
+            reported_modifiers: KeyModifiers::NONE,
             buttons: 0,
             last_position: None,
             last_motion: None,
@@ -132,8 +139,8 @@ impl InputMapper {
         }
     }
 
-    pub fn prefix(&self) -> char {
-        self.prefix
+    pub fn menu_key(&self) -> MenuKey {
+        self.menu_key
     }
 
     /// The lock-key state this event reports, if the terminal reports any.
@@ -149,144 +156,203 @@ impl InputMapper {
         }
     }
 
-    pub fn is_armed(&self) -> bool {
-        self.armed
+    fn local_command(&self, ev: KeyEvent, focus: InputFocus) -> Option<Command> {
+        if ev.kind != KeyEventKind::Press || !ev.modifiers.is_empty() {
+            return None;
+        }
+        if self.menu_key == MenuKey::F8 && ev.code == KeyCode::F(8) {
+            return Some(Command::Menu);
+        }
+        if focus != InputFocus::Menu {
+            return None;
+        }
+        Some(match ev.code {
+            KeyCode::Esc => Command::Menu,
+            KeyCode::Char('8') if self.menu_key == MenuKey::F8 => Command::SendF8,
+            KeyCode::Char('q') => Command::Quit,
+            KeyCode::Char('f') => Command::FullRefresh,
+            KeyCode::Char('r') => Command::Renegotiate,
+            KeyCode::Char('m') => Command::CycleMode,
+            KeyCode::Char('v') => Command::ToggleViewOnly,
+            KeyCode::Char('c') => Command::ToggleStats,
+            KeyCode::Left => Command::Pan(-1, 0),
+            KeyCode::Right => Command::Pan(1, 0),
+            KeyCode::Up => Command::Pan(0, -1),
+            KeyCode::Down => Command::Pan(0, 1),
+            _ => return None,
+        })
     }
 
-    /// Is this the prefix key itself?
-    fn is_prefix(&self, ev: &KeyEvent) -> bool {
-        matches!(ev.code, KeyCode::Char(c)
-            if c.to_ascii_lowercase() == self.prefix
-                && ev.modifiers.contains(KeyModifiers::CONTROL))
-    }
-
-    pub fn on_key(&mut self, ev: KeyEvent) -> KeyOutcome {
-        // While the prefix is armed, no press reaches the server: the next one is a
-        // command. Releases are a different matter. The prefix chord's modifier was
-        // pressed as a key in its own right before the prefix key arrived, so
-        // swallowing its release leaves it latched on the remote, and every later
-        // click becomes a Ctrl-click. `release_if_held` only speaks for keys the
-        // server was told about, so the prefix key's own release stays swallowed.
-        if self.armed {
-            if ev.kind == KeyEventKind::Release {
-                return self.release_if_held(ev);
-            }
-            if ev.kind != KeyEventKind::Press {
-                return KeyOutcome::Ignored;
-            }
-            self.armed = false;
-            if self.is_prefix(&ev) {
-                return KeyOutcome::Local(Command::SendPrefix);
-            }
-            return match command_for(ev.code) {
-                Some(cmd) => KeyOutcome::Local(cmd),
-                None => KeyOutcome::Ignored,
-            };
+    /// Local commands still work in the menu and in view-only mode. Only a key
+    /// whose press reached the remote can later repeat or release there.
+    pub fn on_key(
+        &mut self,
+        mut ev: KeyEvent,
+        alternates: KeyAlternates,
+        focus: InputFocus,
+    ) -> (Vec<Key>, Option<Command>) {
+        let mut out = Vec::new();
+        if let Some(command) = self.local_command(ev, focus) {
+            self.sync_modifiers(&mut out, KeyModifiers::NONE);
+            return (out, Some(command));
         }
 
-        if self.is_prefix(&ev) {
-            if ev.kind == KeyEventKind::Press {
-                self.armed = true;
+        if focus != InputFocus::Remote {
+            ev.modifiers &= self.synthesised;
+        }
+        match keysym(ev.code) {
+            Some(sym) if matches!(ev.code, KeyCode::Modifier(_)) => {
+                self.forward_modifier(&mut out, sym, ev, focus);
             }
-            return KeyOutcome::Ignored;
+            Some(base) if focus == InputFocus::Remote || ev.kind == KeyEventKind::Release => {
+                self.forward_key(&mut out, base, ev, alternates);
+            }
+            _ => self.sync_modifiers(&mut out, self.synthesised & ev.modifiers),
         }
-
-        self.translate(ev)
+        (out, None)
     }
 
-    /// A key arriving while the menu has the focus.
-    ///
-    /// The prefix window still works, because the menu is the list of what it does,
-    /// but a keystroke meant for the remote is swallowed rather than sent -- which is
-    /// what having the focus means. It has to be swallowed *here* rather than by
-    /// dropping what comes back: a press is recorded as held the moment it is
-    /// translated, and throwing the event away after that would leave us believing
-    /// the server holds a key it was never sent, to be released later out of nowhere.
-    ///
-    /// Releases are let through for the mirror of that reason. A key pressed before
-    /// the menu opened is genuinely down on the remote, and its release is the only
-    /// thing that lets go of it.
-    pub fn on_key_local(&mut self, ev: KeyEvent) -> KeyOutcome {
-        if ev.kind != KeyEventKind::Release && !self.armed && !self.is_prefix(&ev) {
-            return KeyOutcome::Ignored;
+    fn forward_key(
+        &mut self,
+        out: &mut Vec<Key>,
+        base: u32,
+        ev: KeyEvent,
+        mut alternates: KeyAlternates,
+    ) {
+        let keypad = ev.state.contains(KeyEventState::KEYPAD);
+        let id = (base, keypad);
+        if ev.kind == KeyEventKind::Release {
+            if let Some(previous) = self.pressed_keys.remove(&id) {
+                // The mask describes the instant of key-up. A modifier that
+                // vanished since key-down must already be up on the remote.
+                self.sync_modifiers(out, ev.modifiers);
+                self.release_if_unowned(out, previous.keysym);
+                // A mask-only terminal may send nothing after a chord's last up.
+                if self.pressed_keys.is_empty() {
+                    self.sync_modifiers(out, self.synthesised & self.reported_modifiers);
+                }
+            } else {
+                self.sync_modifiers(out, self.synthesised & ev.modifiers);
+            }
+            return;
         }
-        self.on_key(ev)
-    }
+        let previous = self.pressed_keys.get(&id).copied();
+        if ev.kind == KeyEventKind::Repeat && previous.is_none() {
+            self.sync_modifiers(out, self.synthesised & ev.modifiers);
+            return;
+        }
 
-    /// Let go of a key the server was told is down, and say nothing otherwise.
-    fn release_if_held(&mut self, ev: KeyEvent) -> KeyOutcome {
-        let Some(sym) = keysym(ev.code) else {
-            return KeyOutcome::Ignored;
+        if ev.kind == KeyEventKind::Repeat
+            && let Some(key) = previous
+        {
+            alternates.shifted = alternates.shifted.or(key.alternates.shifted);
+            alternates.base_layout = alternates.base_layout.or(key.alternates.base_layout);
+        }
+        let sym = match ev.code {
+            KeyCode::Char(c) if !keypad => keysym_for_char(character(ev, c, alternates)),
+            _ => base,
         };
-        let mut out = Vec::new();
-        self.release(&mut out, sym);
-        if out.is_empty() {
-            KeyOutcome::Ignored
-        } else {
-            KeyOutcome::Keys(out)
+        if self.expect_releases {
+            self.pressed_keys.insert(
+                id,
+                PressedKey {
+                    keysym: sym,
+                    alternates,
+                },
+            );
+            if let Some(old) = previous
+                && old.keysym != sym
+            {
+                self.release_if_unowned(out, old.keysym);
+            }
         }
-    }
-
-    /// Send the prefix chord through to the server, as if it had not been caught.
-    pub fn literal_prefix(&mut self) -> Vec<Key> {
-        let mut out = Vec::new();
-        let ctrl = bitmask::CONTROL;
-        let key = super::keysym::keysym_for_char(self.prefix);
-        self.press(&mut out, ctrl);
-        self.press(&mut out, key);
-        self.release(&mut out, key);
-        self.release(&mut out, ctrl);
-        out
-    }
-
-    fn translate(&mut self, ev: KeyEvent) -> KeyOutcome {
-        let Some(sym) = keysym(ev.code) else {
-            return KeyOutcome::Ignored;
-        };
-        let mut out = Vec::new();
-
-        // A terminal that cannot report modifier keys in their own right leaves us
-        // to infer them from each event's modifier set.
+        self.sync_modifiers(out, ev.modifiers);
+        self.press(out, sym);
         if !self.expect_releases {
-            self.sync_modifiers(&mut out, ev.modifiers);
-        }
-
-        match ev.kind {
-            KeyEventKind::Press | KeyEventKind::Repeat => {
-                self.press(&mut out, sym);
-                if !self.expect_releases {
-                    // No release is coming, so make one.
-                    self.release(&mut out, sym);
-                }
-            }
-            KeyEventKind::Release => self.release(&mut out, sym),
-        }
-
-        if out.is_empty() {
-            KeyOutcome::Ignored
-        } else {
-            KeyOutcome::Keys(out)
+            self.release(out, sym);
         }
     }
 
-    /// Bring the remote's modifier state in line with the reported bitmask.
+    fn release_if_unowned(&mut self, out: &mut Vec<Key>, sym: u32) {
+        if !self.pressed_keys.values().any(|key| key.keysym == sym) {
+            self.release(out, sym);
+        }
+    }
+
+    fn forward_modifier(&mut self, out: &mut Vec<Key>, sym: u32, ev: KeyEvent, focus: InputFocus) {
+        let Some((flag, left, right)) = bitmask::MODIFIERS
+            .into_iter()
+            .find(|&(_, left, right)| sym == left || sym == right)
+        else {
+            return;
+        };
+        if self.expect_releases {
+            self.reported_modifiers.insert(flag);
+        }
+        if focus != InputFocus::Remote && ev.kind != KeyEventKind::Release {
+            self.sync_modifiers(out, self.synthesised & ev.modifiers);
+            return;
+        }
+        // The physical transition owns this bit. Other bits describe the state
+        // at the time of the event, even when the transition itself is redundant.
+        let inferred = self.synthesised.contains(flag);
+        let was_forwarded = self.held.contains(&sym) || inferred;
+        let want = if ev.kind == KeyEventKind::Press || was_forwarded {
+            ev.modifiers
+        } else {
+            self.synthesised & ev.modifiers
+        };
+        self.sync_modifiers(out, (want - flag) | (self.synthesised & flag));
+        if ev.kind == KeyEventKind::Repeat && !inferred {
+            return;
+        }
+        self.synthesised.remove(flag);
+        let other = if sym == left { right } else { left };
+        if ev.kind == KeyEventKind::Release {
+            // On key-up an active bit identifies the other physical side.
+            // Press it first so the remote never briefly loses the modifier.
+            if ev.modifiers.contains(flag) {
+                self.hold_modifier(out, other);
+            } else {
+                self.release(out, other);
+            }
+            self.release(out, sym);
+            return;
+        }
+        // A new physical down while the bit was already active identifies
+        // the opposite side as the earlier hold. A repeat identifies the
+        // already-held side itself.
+        let new_press = ev.kind == KeyEventKind::Press && self.expect_releases;
+        if inferred && new_press {
+            self.hold_modifier(out, other);
+        }
+        self.hold_modifier(out, sym);
+        if inferred && !new_press && left != sym {
+            self.release(out, left);
+        }
+        if !self.expect_releases {
+            self.release(out, sym);
+        }
+    }
+
+    fn hold_modifier(&mut self, out: &mut Vec<Key>, sym: u32) {
+        if !self.held.contains(&sym) {
+            self.press(out, sym);
+        }
+    }
+
+    /// Supply only modifiers that the terminal hasn't already pressed explicitly.
     fn sync_modifiers(&mut self, out: &mut Vec<Key>, want: KeyModifiers) {
-        for (flag, sym) in [
-            (KeyModifiers::SHIFT, bitmask::SHIFT),
-            (KeyModifiers::CONTROL, bitmask::CONTROL),
-            (KeyModifiers::ALT, bitmask::ALT),
-            (KeyModifiers::SUPER, bitmask::SUPER),
-            (KeyModifiers::HYPER, bitmask::HYPER),
-            (KeyModifiers::META, bitmask::META),
-        ] {
-            let wanted = want.contains(flag);
-            if wanted != self.synthesised.contains(flag) {
-                if wanted {
-                    self.press(out, sym);
-                } else {
-                    self.release(out, sym);
-                }
-                self.synthesised.set(flag, wanted);
+        for (flag, left, _) in bitmask::MODIFIERS {
+            if self.synthesised.contains(flag) && !want.contains(flag) {
+                self.release(out, left);
+                self.synthesised.remove(flag);
+            }
+        }
+        for (flag, left, right) in bitmask::MODIFIERS {
+            if want.contains(flag) && !self.held.contains(&left) && !self.held.contains(&right) {
+                self.press(out, left);
+                self.synthesised.insert(flag);
             }
         }
     }
@@ -323,6 +389,7 @@ impl InputMapper {
         // Deterministic order makes the traffic reproducible in tests and logs.
         out.sort_by_key(|e| e.keysym);
         self.synthesised = KeyModifiers::NONE;
+        self.pressed_keys.clear();
         out
     }
 
@@ -356,91 +423,95 @@ impl InputMapper {
         )
     }
 
-    /// Translate a mouse event, returning the pointer events to send.
-    ///
-    /// Returns nothing when the pointer is outside the drawn image, so a click on
-    /// the letterbox is not reported as a click on the nearest edge.
-    pub fn on_mouse(&mut self, ev: MouseEvent, layout: &Layout, metrics: &Metrics) -> Vec<Pointer> {
+    /// Translate a mouse report over the drawn image, including the modifiers
+    /// in effect when its button or motion reaches the server.
+    pub fn on_mouse(&mut self, ev: MouseEvent, layout: &Layout, metrics: &Metrics) -> Vec<Input> {
+        // A menu item can close on button-down. Its drag and release still
+        // belong to the menu, including any modifier bits they carry.
+        if let MouseEventKind::Drag(button) | MouseEventKind::Up(button) = ev.kind
+            && self.buttons & button_bit(button) == 0
+        {
+            return Vec::new();
+        }
         let (tx, ty) = self.terminal_pixel(&ev, metrics);
-        let Some((x, y)) = layout.terminal_px_to_src(tx, ty) else {
+        let mut position = layout.terminal_px_to_src(tx, ty);
+        if position.is_none() && matches!(ev.kind, MouseEventKind::Up(_)) {
+            // A gesture that began on the desktop can end on the footer.
+            position = self.pending_motion.or(self.last_position);
+        }
+        let Some((x, y)) = position else {
             return Vec::new();
         };
 
+        // SGR mouse has no fields for Super, Hyper or Meta.
+        let reported = KeyModifiers::SHIFT | KeyModifiers::ALT | KeyModifiers::CONTROL;
+        let mut keys = Vec::new();
+        self.sync_modifiers(&mut keys, (self.synthesised - reported) | ev.modifiers);
+        let motion = matches!(ev.kind, MouseEventKind::Drag(_) | MouseEventKind::Moved);
         let mut out = Vec::new();
+        if (!motion || !keys.is_empty())
+            && let Some(pointer) = self.take_pending_motion()
+        {
+            out.push(Input::Pointer(pointer));
+        }
+        out.extend(keys.into_iter().map(Input::Key));
         match ev.kind {
-            // A button transition must never be held back, and must not land at a
-            // stale position, so anything the rate limit was holding goes first.
-            MouseEventKind::Down(b) => {
-                self.flush_pending(&mut out);
-                self.buttons |= button_bit(b);
-            }
-            MouseEventKind::Up(b) => {
-                self.flush_pending(&mut out);
-                self.buttons &= !button_bit(b);
-            }
+            MouseEventKind::Down(b) => self.buttons |= button_bit(b),
+            MouseEventKind::Up(b) => self.buttons &= !button_bit(b),
             MouseEventKind::Drag(_) | MouseEventKind::Moved => {
-                // Nothing but the position changed; drop it if it did not.
                 if self.last_position == Some((x, y)) {
-                    return Vec::new();
+                    self.pending_motion = None;
+                    return out;
                 }
-                // Too soon since the last report: remember where the pointer got
-                // to and let the next tick send it.
                 if let Some(last) = self.last_motion
                     && last.elapsed() < MOTION_INTERVAL
                 {
                     self.pending_motion = Some((x, y));
-                    return Vec::new();
+                    return out;
                 }
+                self.pending_motion = None;
                 self.last_motion = Some(Instant::now());
             }
             MouseEventKind::ScrollUp
             | MouseEventKind::ScrollDown
             | MouseEventKind::ScrollLeft
             | MouseEventKind::ScrollRight => {
-                self.flush_pending(&mut out);
-                // A wheel notch is a click: press the wheel bit and let go.
-                let bit = match ev.kind {
+                let wheel = match ev.kind {
                     MouseEventKind::ScrollUp => button::WHEEL_UP,
                     MouseEventKind::ScrollDown => button::WHEEL_DOWN,
                     MouseEventKind::ScrollLeft => button::WHEEL_LEFT,
                     _ => button::WHEEL_RIGHT,
                 };
-                self.last_position = Some((x, y));
-                out.push(Pointer {
+                out.push(Input::Pointer(Pointer {
                     x,
                     y,
-                    buttons: self.buttons | bit,
-                });
-                out.push(Pointer {
-                    x,
-                    y,
-                    buttons: self.buttons,
-                });
-                return out;
+                    buttons: self.buttons | wheel,
+                }));
             }
         }
 
         self.last_position = Some((x, y));
-        out.push(Pointer {
+        out.push(Input::Pointer(Pointer {
             x,
             y,
             buttons: self.buttons,
-        });
+        }));
         out
     }
 
     /// Send a position the rate limit held back, if enough time has passed.
-    ///
-    /// Called from the render tick, so a pointer that stops moving still ends up
-    /// where the user left it.
     pub fn flush_motion(&mut self) -> Option<Pointer> {
-        let (x, y) = self.pending_motion?;
         if let Some(last) = self.last_motion
             && last.elapsed() < MOTION_INTERVAL
         {
             return None;
         }
-        self.pending_motion = None;
+        self.take_pending_motion()
+    }
+
+    /// Flush motion before a key or button changes how the remote interprets it.
+    pub fn take_pending_motion(&mut self) -> Option<Pointer> {
+        let (x, y) = self.pending_motion.take()?;
         self.last_motion = Some(Instant::now());
         self.last_position = Some((x, y));
         Some(Pointer {
@@ -450,29 +521,47 @@ impl InputMapper {
         })
     }
 
-    /// Emit a held-back position immediately, before an event that must not be
-    /// reordered behind it.
-    fn flush_pending(&mut self, out: &mut Vec<Pointer>) {
-        if let Some((x, y)) = self.pending_motion.take() {
-            self.last_motion = Some(Instant::now());
-            self.last_position = Some((x, y));
-            out.push(Pointer {
-                x,
-                y,
-                buttons: self.buttons,
-            });
-        }
-    }
-
     /// Let go of every pointer button, for the same reason as `release_all`.
     pub fn release_buttons(&mut self) -> Option<Pointer> {
+        self.pending_motion = None;
         if self.buttons == 0 {
             return None;
         }
         self.buttons = 0;
-        self.pending_motion = None;
         let (x, y) = self.last_position.unwrap_or((0, 0));
         Some(Pointer { x, y, buttons: 0 })
+    }
+}
+
+/// Kitty reports the unshifted key in every transition. Some terminals omit
+/// alternate key codes even when requested, including for Ctrl+Shift+letter.
+fn character(ev: KeyEvent, base: char, alternates: KeyAlternates) -> char {
+    let shift = ev.modifiers.contains(KeyModifiers::SHIFT);
+    let caps = ev.state.contains(KeyEventState::CAPS_LOCK);
+    if shift && let Some(alternate) = alternates.shifted {
+        if caps
+            && base.is_lowercase()
+            && (base.to_uppercase().eq([alternate]) || alternate.to_lowercase().eq([base]))
+        {
+            return base;
+        }
+        return alternate;
+    }
+    if shift ^ caps && base.is_lowercase() {
+        // RFB accepts one keysym per key. A multi-character case mapping cannot
+        // describe the key (for example, the uppercase expansion of ß).
+        let mut upper = base.to_uppercase();
+        if let (Some(c), None) = (upper.next(), upper.next()) {
+            return c;
+        }
+    }
+    match (shift, base, alternates.base_layout) {
+        // Without a shifted code, the PC-101 positions of French AZERTY minus
+        // and underscore distinguish its number row from the US minus key.
+        (true, '-', Some('6')) => '6',
+        (true, '_', Some('8')) => '8',
+        (true, '-', None | Some('-')) => '_',
+        _ => base,
     }
 }
 
@@ -484,31 +573,16 @@ fn button_bit(b: MouseButton) -> u8 {
     }
 }
 
-/// The command bound to a key in the prefix window.
-fn command_for(code: KeyCode) -> Option<Command> {
-    Some(match code {
-        KeyCode::Char('q') => Command::Quit,
-        KeyCode::Char('f') => Command::FullRefresh,
-        KeyCode::Char('r') => Command::Renegotiate,
-        KeyCode::Char('m') => Command::CycleMode,
-        KeyCode::Char('v') => Command::ToggleViewOnly,
-        KeyCode::Char('c') => Command::ToggleStats,
-        // Nothing else opens the menu, and the menu is where the rest of these are
-        // listed, so this is the one binding worth remembering -- which is why it is
-        // the one the status line names.
-        KeyCode::Char('p') => Command::Menu,
-        KeyCode::Left => Command::Pan(-1, 0),
-        KeyCode::Right => Command::Pan(1, 0),
-        KeyCode::Up => Command::Pan(0, -1),
-        KeyCode::Down => Command::Pan(0, 1),
-        _ => return None,
-    })
-}
-
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::render::Layout;
+    use InputFocus::{Menu, Remote};
+
+    const NO_ALTERNATES: KeyAlternates = KeyAlternates {
+        shifted: None,
+        base_layout: None,
+    };
 
     fn key(code: KeyCode, kind: KeyEventKind, mods: KeyModifiers) -> KeyEvent {
         KeyEvent {
@@ -531,6 +605,113 @@ mod tests {
         key(KeyCode::Char(c), kind, KeyModifiers::CONTROL)
     }
 
+    fn transitions(keys: Vec<Key>) -> Vec<(u32, bool)> {
+        keys.into_iter().map(|k| (k.keysym, k.down)).collect()
+    }
+
+    #[test]
+    fn a_local_f8_press_cannot_repeat_remotely_after_shift_changes() {
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        let f8 = KeyCode::F(8);
+        assert_eq!(
+            input.on_key(press(f8), NO_ALTERNATES, Remote),
+            (vec![], Some(Command::Menu))
+        );
+        assert_eq!(
+            input.on_key(press(KeyCode::Esc), NO_ALTERNATES, Menu).1,
+            Some(Command::Menu)
+        );
+        for kind in [KeyEventKind::Repeat, KeyEventKind::Release] {
+            assert_eq!(
+                input.on_key(key(f8, kind, KeyModifiers::SHIFT), NO_ALTERNATES, Remote),
+                (vec![], None)
+            );
+        }
+        assert!(input.release_all().is_empty());
+    }
+
+    #[test]
+    fn a_keypad_press_does_not_authorise_a_top_row_repeat() {
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        let mut keypad = press(KeyCode::Char('1'));
+        keypad.state.insert(KeyEventState::KEYPAD);
+        input.on_key(keypad, NO_ALTERNATES, Remote);
+        assert_eq!(
+            input.on_key(ctrl('1', KeyEventKind::Repeat), NO_ALTERNATES, Remote),
+            (vec![], None)
+        );
+        keypad.kind = KeyEventKind::Repeat;
+        let (keys, _) = input.on_key(keypad, NO_ALTERNATES, Remote);
+        assert_eq!(transitions(keys), [(u32::from('1'), true)]);
+    }
+
+    #[test]
+    fn a_physical_shift_report_releases_stale_inferred_alt_first() {
+        use crossterm::event::ModifierKeyCode::LeftShift;
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        input.on_key(
+            key(KeyCode::Char('v'), KeyEventKind::Press, KeyModifiers::ALT),
+            NO_ALTERNATES,
+            Remote,
+        );
+        let (keys, _) = input.on_key(
+            key(
+                KeyCode::Modifier(LeftShift),
+                KeyEventKind::Press,
+                KeyModifiers::SHIFT,
+            ),
+            NO_ALTERNATES,
+            Remote,
+        );
+        assert_eq!(
+            transitions(keys),
+            [(bitmask::ALT, false), (bitmask::SHIFT, true)]
+        );
+    }
+
+    #[test]
+    fn a_shared_keysym_stays_down_when_a_keypad_release_clears_control() {
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        let minus = KeyCode::Char('-');
+        input.on_key(press(minus), NO_ALTERNATES, Remote);
+        let mut keypad = key(minus, KeyEventKind::Press, KeyModifiers::CONTROL);
+        keypad.state.insert(KeyEventState::KEYPAD);
+        input.on_key(keypad, NO_ALTERNATES, Remote);
+        keypad.kind = KeyEventKind::Release;
+        keypad.modifiers = KeyModifiers::NONE;
+        let (keys, _) = input.on_key(keypad, NO_ALTERNATES, Remote);
+        assert_eq!(transitions(keys), [(bitmask::CONTROL, false)]);
+        let (keys, _) = input.on_key(release(minus), NO_ALTERNATES, Remote);
+        assert_eq!(transitions(keys), [(u32::from('-'), false)]);
+        assert!(input.release_all().is_empty());
+    }
+
+    #[test]
+    fn an_unforwarded_key_up_can_update_the_modifier_of_a_drag() {
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        let click = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Left),
+            column: 10,
+            row: 10,
+            modifiers: KeyModifiers::CONTROL,
+        };
+        input.on_mouse(click, &native_layout(), &metrics());
+        let (keys, _) = input.on_key(ctrl('z', KeyEventKind::Release), NO_ALTERNATES, Remote);
+        assert!(keys.is_empty());
+        let (keys, _) = input.on_key(release(KeyCode::Char('z')), NO_ALTERNATES, Remote);
+        assert_eq!(transitions(keys), [(bitmask::CONTROL, false)]);
+    }
+
+    fn pointers(events: Vec<Input>) -> Vec<Pointer> {
+        events
+            .into_iter()
+            .map(|event| match event {
+                Input::Pointer(pointer) => pointer,
+                other => panic!("unexpected input {other:?}"),
+            })
+            .collect()
+    }
+
     fn metrics() -> Metrics {
         Metrics {
             cols: 200,
@@ -550,29 +731,33 @@ mod tests {
 
     #[test]
     fn a_key_press_and_release_pass_straight_through() {
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         assert_eq!(
-            input.on_key(press(KeyCode::Char('x'))),
-            KeyOutcome::Keys(vec![Key {
-                keysym: 0x78,
-                down: true
-            }])
+            input.on_key(press(KeyCode::Char('x')), NO_ALTERNATES, Remote),
+            (
+                vec![Key {
+                    keysym: 0x78,
+                    down: true
+                }],
+                None
+            )
         );
         assert_eq!(
-            input.on_key(release(KeyCode::Char('x'))),
-            KeyOutcome::Keys(vec![Key {
-                keysym: 0x78,
-                down: false
-            }])
+            input.on_key(release(KeyCode::Char('x')), NO_ALTERNATES, Remote),
+            (
+                vec![Key {
+                    keysym: 0x78,
+                    down: false
+                }],
+                None
+            )
         );
     }
 
     #[test]
     fn a_terminal_without_releases_gets_a_synthesised_one() {
-        let mut input = InputMapper::new('a', false, true);
-        let KeyOutcome::Keys(events) = input.on_key(press(KeyCode::Char('x'))) else {
-            panic!("expected key events");
-        };
+        let mut input = InputMapper::new(MenuKey::F8, false, true);
+        let (events, _) = input.on_key(press(KeyCode::Char('x')), NO_ALTERNATES, Remote);
         assert_eq!(events.len(), 2, "{events:?}");
         assert!(events[0].down);
         assert!(!events[1].down);
@@ -580,16 +765,14 @@ mod tests {
     }
 
     #[test]
-    fn modifiers_are_synthesised_only_when_the_terminal_cannot_report_them() {
-        let mut input = InputMapper::new('a', false, true);
-        let KeyOutcome::Keys(events) = input.on_key(key(
-            KeyCode::Char('c'),
-            KeyEventKind::Press,
-            KeyModifiers::SHIFT,
-        )) else {
-            panic!("expected key events");
-        };
-        // Shift down, c down, c up. Shift stays down until it is reported gone.
+    fn a_press_only_terminal_sends_shift_and_the_shifted_letter() {
+        let mut input = InputMapper::new(MenuKey::F8, false, true);
+        let (events, _) = input.on_key(
+            key(KeyCode::Char('c'), KeyEventKind::Press, KeyModifiers::SHIFT),
+            NO_ALTERNATES,
+            Remote,
+        );
+        // Shift down, C down, C up. Shift stays down until it is reported gone.
         assert_eq!(
             events[0],
             Key {
@@ -597,13 +780,11 @@ mod tests {
                 down: true
             }
         );
-        assert_eq!(events[1].keysym, 0x63);
+        assert_eq!(events[1].keysym, u32::from('C'));
         assert!(!events[2].down);
 
         // Now without shift: it has to be released.
-        let KeyOutcome::Keys(events) = input.on_key(press(KeyCode::Char('c'))) else {
-            panic!("expected key events");
-        };
+        let (events, _) = input.on_key(press(KeyCode::Char('c')), NO_ALTERNATES, Remote);
         assert_eq!(
             events[0],
             Key {
@@ -617,14 +798,16 @@ mod tests {
     fn a_terminal_with_the_keyboard_protocol_sends_its_own_modifier_keys() {
         // The modifier arrives as a key in its own right, so inferring it from the
         // bitmask as well would press it twice.
-        let mut input = InputMapper::new('a', true, true);
-        let KeyOutcome::Keys(events) = input.on_key(key(
-            KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl),
-            KeyEventKind::Press,
-            KeyModifiers::CONTROL,
-        )) else {
-            panic!("expected key events");
-        };
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        let (events, _) = input.on_key(
+            key(
+                KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl),
+                KeyEventKind::Press,
+                KeyModifiers::CONTROL,
+            ),
+            NO_ALTERNATES,
+            Remote,
+        );
         assert_eq!(
             events,
             vec![Key {
@@ -633,13 +816,15 @@ mod tests {
             }]
         );
 
-        let KeyOutcome::Keys(events) = input.on_key(key(
-            KeyCode::Char('c'),
-            KeyEventKind::Press,
-            KeyModifiers::CONTROL,
-        )) else {
-            panic!("expected key events");
-        };
+        let (events, _) = input.on_key(
+            key(
+                KeyCode::Char('c'),
+                KeyEventKind::Press,
+                KeyModifiers::CONTROL,
+            ),
+            NO_ALTERNATES,
+            Remote,
+        );
         assert_eq!(
             events,
             vec![Key {
@@ -651,136 +836,180 @@ mod tests {
     }
 
     #[test]
-    fn a_release_is_never_sent_for_a_key_that_was_not_pressed() {
-        // This is what keeps a swallowed prefix chord from leaking a stray release
-        // and leaving a modifier stuck on the remote.
-        let mut input = InputMapper::new('a', true, true);
-        assert_eq!(
-            input.on_key(release(KeyCode::Char('z'))),
-            KeyOutcome::Ignored
-        );
-        assert_eq!(
-            input.on_key(release(KeyCode::Modifier(
-                crossterm::event::ModifierKeyCode::LeftControl
-            ))),
-            KeyOutcome::Ignored
-        );
-    }
+    fn a_physical_repeat_identifies_the_side_of_an_inferred_modifier() {
+        use crossterm::event::ModifierKeyCode;
 
-    #[test]
-    fn the_prefix_arms_and_the_next_key_is_a_command() {
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        input.on_key(ctrl('v', KeyEventKind::Press), NO_ALTERNATES, Remote);
+        input.on_key(ctrl('c', KeyEventKind::Press), NO_ALTERNATES, Remote);
         assert_eq!(
-            input.on_key(ctrl('a', KeyEventKind::Press)),
-            KeyOutcome::Ignored
+            input.on_key(ctrl('v', KeyEventKind::Release), NO_ALTERNATES, Remote),
+            (
+                vec![Key {
+                    keysym: u32::from('v'),
+                    down: false
+                }],
+                None
+            )
         );
-        assert!(input.is_armed());
-        // The release of the chord is swallowed too.
+        let right = KeyCode::Modifier(ModifierKeyCode::RightControl);
         assert_eq!(
-            input.on_key(ctrl('a', KeyEventKind::Release)),
-            KeyOutcome::Ignored
-        );
-        assert!(input.is_armed());
-        assert_eq!(
-            input.on_key(press(KeyCode::Char('q'))),
-            KeyOutcome::Local(Command::Quit)
-        );
-        assert!(!input.is_armed());
-    }
-
-    #[test]
-    fn the_prefix_does_not_leave_its_modifier_held_on_the_remote() {
-        // The Control press reaches the server as a key of its own, before anything
-        // knows a prefix chord is coming. Swallowing its release would latch Control
-        // down on the remote and turn every later click into a Ctrl-click.
-        let mut input = InputMapper::new('a', true, true);
-        let ctrl_l = KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl);
-        input.on_key(key(ctrl_l, KeyEventKind::Press, KeyModifiers::CONTROL));
-        input.on_key(ctrl('a', KeyEventKind::Press));
-        assert!(input.is_armed());
-
-        // The prefix key's own release is still swallowed: it was never pressed.
-        assert_eq!(
-            input.on_key(ctrl('a', KeyEventKind::Release)),
-            KeyOutcome::Ignored
+            input.on_key(
+                key(right, KeyEventKind::Repeat, KeyModifiers::CONTROL),
+                NO_ALTERNATES,
+                Remote
+            ),
+            (
+                vec![
+                    Key {
+                        keysym: 0xffe4,
+                        down: true
+                    },
+                    Key {
+                        keysym: bitmask::CONTROL,
+                        down: false
+                    },
+                ],
+                None
+            )
         );
         assert_eq!(
-            input.on_key(key(ctrl_l, KeyEventKind::Release, KeyModifiers::NONE)),
-            KeyOutcome::Keys(vec![Key {
-                keysym: 0xffe3,
-                down: false
-            }])
+            input.on_key(ctrl('c', KeyEventKind::Release), NO_ALTERNATES, Remote),
+            (
+                vec![Key {
+                    keysym: u32::from('c'),
+                    down: false
+                }],
+                None
+            )
         );
-        assert!(input.is_armed(), "the window is still open for a command");
-        assert!(input.release_all().is_empty(), "nothing left held");
-    }
-
-    #[test]
-    fn the_prefix_twice_sends_it_through() {
-        let mut input = InputMapper::new('a', true, true);
-        input.on_key(ctrl('a', KeyEventKind::Press));
         assert_eq!(
-            input.on_key(ctrl('a', KeyEventKind::Press)),
-            KeyOutcome::Local(Command::SendPrefix)
+            input.on_key(release(right), NO_ALTERNATES, Remote),
+            (
+                vec![Key {
+                    keysym: 0xffe4,
+                    down: false
+                }],
+                None
+            )
         );
-        let events = input.literal_prefix();
-        assert_eq!(events.len(), 4);
-        assert_eq!(
-            events[0],
-            Key {
-                keysym: bitmask::CONTROL,
-                down: true
-            }
-        );
-        assert_eq!(events[1].keysym, 0x61);
-        assert!(!events[3].down);
-        // And nothing is left held afterwards.
         assert!(input.release_all().is_empty());
     }
 
     #[test]
-    fn an_unbound_key_in_the_prefix_window_does_nothing() {
-        let mut input = InputMapper::new('a', true, true);
-        input.on_key(ctrl('a', KeyEventKind::Press));
-        assert_eq!(input.on_key(press(KeyCode::Char('%'))), KeyOutcome::Ignored);
-        assert!(!input.is_armed(), "the window closes either way");
-    }
-
-    #[test]
-    fn prefix_commands_cover_the_documented_bindings() {
-        assert_eq!(command_for(KeyCode::Char('q')), Some(Command::Quit));
-        assert_eq!(command_for(KeyCode::Char('f')), Some(Command::FullRefresh));
-        assert_eq!(command_for(KeyCode::Char('r')), Some(Command::Renegotiate));
-        assert_eq!(command_for(KeyCode::Char('m')), Some(Command::CycleMode));
-        assert_eq!(command_for(KeyCode::Left), Some(Command::Pan(-1, 0)));
-        assert_eq!(
-            command_for(KeyCode::Char('v')),
-            Some(Command::ToggleViewOnly)
-        );
-        assert_eq!(command_for(KeyCode::Char('c')), Some(Command::ToggleStats));
-        // The menu, and the only key that opens it.
-        assert_eq!(command_for(KeyCode::Char('p')), Some(Command::Menu));
-        assert!(
-            ('a'..='z')
-                .filter(|c| command_for(KeyCode::Char(*c)) == Some(Command::Menu))
-                .eq(['p']),
-            "more than one key opens the menu, or none does"
-        );
-        for gone in ['h', '?'] {
-            assert_eq!(command_for(KeyCode::Char(gone)), None, "{gone} still binds");
+    fn caps_lock_inverts_the_shifted_case_of_a_kitty_letter() {
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        for (base, shift, shifted, expected) in [
+            ('v', false, None, 'V'),
+            ('v', true, None, 'v'),
+            ('ä', false, None, 'Ä'),
+            ('ä', true, Some('Ä'), 'ä'),
+            ('ä', true, None, 'ä'),
+            ('ς', true, Some('Σ'), 'ς'),
+            ('é', true, Some('2'), '2'),
+            ('ß', false, None, 'ß'),
+            ('ß', true, Some('ẞ'), 'ß'),
+            ('1', false, None, '1'),
+        ] {
+            let mods = if shift {
+                KeyModifiers::SHIFT
+            } else {
+                KeyModifiers::NONE
+            };
+            let mut ev = key(KeyCode::Char(base), KeyEventKind::Press, mods);
+            ev.state = KeyEventState::CAPS_LOCK;
+            let (events, _) = input.on_key(
+                ev,
+                KeyAlternates {
+                    shifted,
+                    base_layout: None,
+                },
+                Remote,
+            );
+            assert_eq!(events.last().unwrap().keysym, keysym_for_char(expected));
+            let (events, _) = input.on_key(release(KeyCode::Char(base)), NO_ALTERNATES, Remote);
+            let char_up = Key {
+                keysym: keysym_for_char(expected),
+                down: false,
+            };
+            // This release carries an empty mask, so an inferred Shift went
+            // up first. The character still releases its original keysym.
+            if shift {
+                assert_eq!(
+                    events,
+                    [
+                        Key {
+                            keysym: bitmask::SHIFT,
+                            down: false
+                        },
+                        char_up
+                    ]
+                );
+            } else {
+                assert_eq!(events, [char_up]);
+            }
+            assert!(input.release_all().is_empty());
         }
     }
 
     #[test]
-    fn the_menu_swallows_what_would_have_reached_the_remote() {
-        let mut input = InputMapper::new('a', true, true);
+    fn a_release_is_never_sent_for_a_key_that_was_not_pressed() {
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         assert_eq!(
-            input.on_key_local(press(KeyCode::Char('x'))),
-            KeyOutcome::Ignored
+            input.on_key(release(KeyCode::Char('z')), NO_ALTERNATES, Remote),
+            (vec![], None)
         );
         assert_eq!(
-            input.on_key_local(release(KeyCode::Char('x'))),
-            KeyOutcome::Ignored
+            input.on_key(
+                release(KeyCode::Modifier(
+                    crossterm::event::ModifierKeyCode::LeftControl
+                )),
+                NO_ALTERNATES,
+                Remote
+            ),
+            (vec![], None)
+        );
+    }
+
+    #[test]
+    fn command_shortcuts_act_only_inside_the_open_menu() {
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        for (code, command) in [
+            (KeyCode::Esc, Command::Menu),
+            (KeyCode::Char('8'), Command::SendF8),
+            (KeyCode::Char('q'), Command::Quit),
+            (KeyCode::Char('f'), Command::FullRefresh),
+            (KeyCode::Char('r'), Command::Renegotiate),
+            (KeyCode::Char('m'), Command::CycleMode),
+            (KeyCode::Char('v'), Command::ToggleViewOnly),
+            (KeyCode::Char('c'), Command::ToggleStats),
+            (KeyCode::Left, Command::Pan(-1, 0)),
+            (KeyCode::Right, Command::Pan(1, 0)),
+            (KeyCode::Up, Command::Pan(0, -1)),
+            (KeyCode::Down, Command::Pan(0, 1)),
+        ] {
+            assert_eq!(input.local_command(press(code), Remote), None);
+            assert_eq!(
+                input.on_key(press(code), NO_ALTERNATES, Menu),
+                (vec![], Some(command))
+            );
+        }
+        assert_eq!(
+            input.on_key(press(KeyCode::Char('p')), NO_ALTERNATES, Menu),
+            (vec![], None)
+        );
+    }
+
+    #[test]
+    fn the_menu_swallows_what_would_have_reached_the_remote() {
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        assert_eq!(
+            input.on_key(press(KeyCode::Char('x')), NO_ALTERNATES, Menu),
+            (vec![], None)
+        );
+        assert_eq!(
+            input.on_key(release(KeyCode::Char('x')), NO_ALTERNATES, Menu),
+            (vec![], None)
         );
         // The point of swallowing it here rather than dropping what comes back: a
         // translated press is recorded as held, and would be released later for a key
@@ -793,56 +1022,59 @@ mod tests {
 
     #[test]
     fn the_menu_still_lets_go_of_a_key_held_before_it_opened() {
-        let mut input = InputMapper::new('a', true, true);
-        let KeyOutcome::Keys(_) = input.on_key(press(KeyCode::Char('x'))) else {
-            panic!("the press should have gone to the remote");
-        };
-        let KeyOutcome::Keys(events) = input.on_key_local(release(KeyCode::Char('x'))) else {
-            panic!("the release was swallowed, so the key stays down on the remote");
-        };
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        assert!(
+            !input
+                .on_key(press(KeyCode::Char('x')), NO_ALTERNATES, Remote)
+                .0
+                .is_empty()
+        );
+        let (events, _) = input.on_key(release(KeyCode::Char('x')), NO_ALTERNATES, Menu);
         assert_eq!(events.len(), 1);
         assert!(!events[0].down);
         assert!(input.release_all().is_empty(), "and it is no longer held");
     }
 
     #[test]
-    fn the_prefix_window_works_while_the_menu_is_up() {
-        // The menu is the list of what the prefix does, so the keys it lists have to
-        // work while it is being read.
-        let mut input = InputMapper::new('a', true, true);
-        assert_eq!(
-            input.on_key_local(ctrl('a', KeyEventKind::Press)),
-            KeyOutcome::Ignored
-        );
-        assert!(input.is_armed());
-        assert_eq!(
-            input.on_key_local(press(KeyCode::Char('q'))),
-            KeyOutcome::Local(Command::Quit)
-        );
-    }
-
-    #[test]
     fn release_all_lets_go_of_everything_still_down() {
-        let mut input = InputMapper::new('a', true, true);
-        input.on_key(press(KeyCode::Char('a')));
-        input.on_key(press(KeyCode::Char('b')));
-        input.on_key(key(
-            KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl),
-            KeyEventKind::Press,
-            KeyModifiers::CONTROL,
-        ));
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        input.on_key(press(KeyCode::Char('a')), NO_ALTERNATES, Remote);
+        input.on_key(
+            key(KeyCode::Char('-'), KeyEventKind::Press, KeyModifiers::SHIFT),
+            NO_ALTERNATES,
+            Remote,
+        );
+        input.on_key(
+            key(
+                KeyCode::Modifier(crossterm::event::ModifierKeyCode::LeftControl),
+                KeyEventKind::Press,
+                KeyModifiers::CONTROL,
+            ),
+            NO_ALTERNATES,
+            Remote,
+        );
         let released = input.release_all();
-        assert_eq!(released.len(), 3);
         assert!(released.iter().all(|e| !e.down));
-        assert_eq!(released.last().unwrap().keysym, 0xffe3);
+        let syms: Vec<_> = released.iter().map(|e| e.keysym).collect();
+        assert_eq!(syms, [u32::from('_'), u32::from('a'), bitmask::CONTROL]);
         assert!(input.release_all().is_empty(), "and only once");
+        assert_eq!(
+            input.on_key(press(KeyCode::Char('-')), NO_ALTERNATES, Remote),
+            (
+                vec![Key {
+                    keysym: u32::from('-'),
+                    down: true
+                }],
+                None
+            )
+        );
     }
 
     #[test]
     fn pointer_position_is_pixel_exact_with_mode_1016() {
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         let layout = native_layout();
-        let events = input.on_mouse(
+        let events = pointers(input.on_mouse(
             MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: 37,
@@ -851,16 +1083,16 @@ mod tests {
             },
             &layout,
             &metrics(),
-        );
+        ));
         assert_eq!(events.len(), 1);
         assert_eq!((events[0].x, events[0].y), (37, 91));
     }
 
     #[test]
     fn without_mode_1016_the_pointer_aims_at_the_cell_centre() {
-        let mut input = InputMapper::new('a', true, false);
+        let mut input = InputMapper::new(MenuKey::F8, true, false);
         let layout = native_layout();
-        let events = input.on_mouse(
+        let events = pointers(input.on_mouse(
             MouseEvent {
                 kind: MouseEventKind::Moved,
                 column: 4,
@@ -869,7 +1101,7 @@ mod tests {
             },
             &layout,
             &metrics(),
-        );
+        ));
         assert_eq!((events[0].x, events[0].y), (4 * 8 + 4, 5 * 17 + 8));
     }
 
@@ -886,14 +1118,14 @@ mod tests {
             row,
             modifiers: KeyModifiers::NONE,
         };
-        let pixels = InputMapper::new('a', true, true);
+        let pixels = InputMapper::new(MenuKey::F8, true, true);
         assert_eq!(pixels.terminal_cell(&at(0, 0), &m), (0, 0));
         assert_eq!(
             pixels.terminal_cell(&at(8 * 12 + 3, 17 * 7 + 9), &m),
             (12, 7)
         );
 
-        let cells = InputMapper::new('a', true, false);
+        let cells = InputMapper::new(MenuKey::F8, true, false);
         for (col, row) in [(0, 0), (12, 7), (m.cols - 1, m.rows - 1)] {
             assert_eq!(cells.terminal_cell(&at(col, row), &m), (col, row));
         }
@@ -901,7 +1133,7 @@ mod tests {
 
     #[test]
     fn buttons_accumulate_and_clear() {
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         let layout = native_layout();
         let m = metrics();
         let at = |kind| MouseEvent {
@@ -911,11 +1143,11 @@ mod tests {
             modifiers: KeyModifiers::NONE,
         };
 
-        let e = input.on_mouse(at(MouseEventKind::Down(MouseButton::Left)), &layout, &m);
+        let e = pointers(input.on_mouse(at(MouseEventKind::Down(MouseButton::Left)), &layout, &m));
         assert_eq!(e[0].buttons, button::LEFT);
-        let e = input.on_mouse(at(MouseEventKind::Down(MouseButton::Right)), &layout, &m);
+        let e = pointers(input.on_mouse(at(MouseEventKind::Down(MouseButton::Right)), &layout, &m));
         assert_eq!(e[0].buttons, button::LEFT | button::RIGHT);
-        let e = input.on_mouse(at(MouseEventKind::Up(MouseButton::Left)), &layout, &m);
+        let e = pointers(input.on_mouse(at(MouseEventKind::Up(MouseButton::Left)), &layout, &m));
         assert_eq!(e[0].buttons, button::RIGHT);
 
         let stop = input.release_buttons().unwrap();
@@ -924,10 +1156,39 @@ mod tests {
     }
 
     #[test]
-    fn a_wheel_notch_is_a_press_and_a_release() {
-        let mut input = InputMapper::new('a', true, true);
+    fn a_remote_button_released_over_the_footer_uses_its_last_position() {
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         let layout = native_layout();
-        let events = input.on_mouse(
+        let m = metrics();
+        let mut ev = MouseEvent {
+            kind: MouseEventKind::Down(MouseButton::Right),
+            column: 10,
+            row: 12,
+            modifiers: KeyModifiers::NONE,
+        };
+        input.on_mouse(ev, &layout, &m);
+        ev.row = m.image_area().1 as u16;
+        ev.kind = MouseEventKind::Up(MouseButton::Left);
+        ev.modifiers = KeyModifiers::CONTROL;
+        assert!(input.on_mouse(ev, &layout, &m).is_empty());
+        ev.kind = MouseEventKind::Up(MouseButton::Right);
+        ev.modifiers = KeyModifiers::NONE;
+        assert_eq!(
+            pointers(input.on_mouse(ev, &layout, &m)),
+            [Pointer {
+                x: 10,
+                y: 12,
+                buttons: 0
+            }]
+        );
+        assert!(input.release_buttons().is_none());
+    }
+
+    #[test]
+    fn a_wheel_notch_is_a_press_and_a_release() {
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
+        let layout = native_layout();
+        let events = pointers(input.on_mouse(
             MouseEvent {
                 kind: MouseEventKind::ScrollUp,
                 column: 1,
@@ -936,7 +1197,7 @@ mod tests {
             },
             &layout,
             &metrics(),
-        );
+        ));
         assert_eq!(events.len(), 2);
         assert_eq!(events[0].buttons, button::WHEEL_UP);
         assert_eq!(events[1].buttons, 0);
@@ -944,7 +1205,7 @@ mod tests {
 
     #[test]
     fn a_wheel_notch_while_dragging_keeps_the_held_button() {
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         let layout = native_layout();
         let m = metrics();
         input.on_mouse(
@@ -957,7 +1218,7 @@ mod tests {
             &layout,
             &m,
         );
-        let events = input.on_mouse(
+        let events = pointers(input.on_mouse(
             MouseEvent {
                 kind: MouseEventKind::ScrollDown,
                 column: 1,
@@ -966,7 +1227,7 @@ mod tests {
             },
             &layout,
             &m,
-        );
+        ));
         assert_eq!(events[0].buttons, button::LEFT | button::WHEEL_DOWN);
         assert_eq!(events[1].buttons, button::LEFT);
     }
@@ -975,7 +1236,7 @@ mod tests {
     fn motion_is_rate_limited_and_the_last_position_still_arrives() {
         // A pixel-reporting terminal can emit motion far faster than any desktop
         // needs. Intermediate positions may be dropped; the final one may not.
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         let layout = native_layout();
         let m = metrics();
         let at = |col| MouseEvent {
@@ -1009,7 +1270,7 @@ mod tests {
     fn a_click_flushes_held_back_motion_first() {
         // Otherwise the button would land wherever the last report happened to be,
         // which is the classic off-by-a-few-pixels click bug.
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         let layout = native_layout();
         let m = metrics();
         let ev = |kind, col| MouseEvent {
@@ -1026,7 +1287,8 @@ mod tests {
                 .is_empty()
         );
 
-        let events = input.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 44), &layout, &m);
+        let events =
+            pointers(input.on_mouse(ev(MouseEventKind::Down(MouseButton::Left), 44), &layout, &m));
         assert_eq!(
             events.len(),
             2,
@@ -1038,7 +1300,7 @@ mod tests {
 
     #[test]
     fn a_wheel_notch_is_never_held_back() {
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         let layout = native_layout();
         let m = metrics();
         input.on_mouse(
@@ -1051,7 +1313,7 @@ mod tests {
             &layout,
             &m,
         );
-        let events = input.on_mouse(
+        let events = pointers(input.on_mouse(
             MouseEvent {
                 kind: MouseEventKind::ScrollUp,
                 column: 6,
@@ -1060,7 +1322,7 @@ mod tests {
             },
             &layout,
             &m,
-        );
+        ));
         assert!(
             events.iter().any(|e| e.buttons == button::WHEEL_UP),
             "the notch must go out immediately: {events:?}"
@@ -1069,7 +1331,7 @@ mod tests {
 
     #[test]
     fn releasing_buttons_drops_any_held_back_motion() {
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         let layout = native_layout();
         let m = metrics();
         input.on_mouse(
@@ -1102,7 +1364,7 @@ mod tests {
 
     #[test]
     fn repeated_motion_at_the_same_pixel_is_dropped() {
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         let layout = native_layout();
         let m = metrics();
         let ev = MouseEvent {
@@ -1120,7 +1382,7 @@ mod tests {
         let m = metrics();
         // A letterboxed layout: the image does not fill the area.
         let layout = Layout::compute(&m, ScaleMode::Fit, 1920, 1080, (0, 0));
-        let mut input = InputMapper::new('a', true, true);
+        let mut input = InputMapper::new(MenuKey::F8, true, true);
         assert!(
             input
                 .on_mouse(

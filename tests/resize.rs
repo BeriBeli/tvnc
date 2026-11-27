@@ -31,6 +31,44 @@ const RESIZE_DEBOUNCE: Duration = Duration::from_millis(100);
 /// against the span that actually elapsed.
 const SETTLING: Duration = Duration::from_millis(400);
 
+#[test]
+fn a_cell_only_resize_keeps_the_vnc_keyboard_responsive() {
+    let timeout = Duration::from_secs(10);
+    for replies in [GHOSTTY_REPLIES, NO_KEYBOARD_REPLIES] {
+        let server = FakeServer::start(1024, 768, Resize::Accept);
+        let addr = server.addr.to_string();
+        let mut term = FakeTerm::spawn(COLS, ROWS, PIXELS.0, PIXELS.1, &[&addr, "--fps", "20"]);
+        term.answer_probe(replies);
+        assert_reports_size(&term, EXPECTED_SIZE, timeout);
+
+        term.resize(100, 25, 0, 0);
+        assert_reports_size(&term, "800x408", timeout);
+        // A key sent after SIGWINCH must still reach the server with a release.
+        if replies == GHOSTTY_REPLIES {
+            term.send(b"\x1b[122u\x1b[122;1:3u");
+        } else {
+            term.send(b"z");
+        }
+        for down in [true, false] {
+            assert!(
+                server
+                    .wait_for(timeout, |req| matches!(
+                        req, Request::Key { keysym: 122, down: pressed } if *pressed == down
+                    ))
+                    .is_some(),
+                "missing remote z event, down={down}"
+            );
+        }
+        assert_eq!(
+            count(&term.output(), b"\x1b[14t"),
+            1,
+            "unexpected pixel query during input"
+        );
+        quit(&mut term);
+        assert!(term.wait(timeout).unwrap().success());
+    }
+}
+
 /// How many `SetDesktopSize` requests a drag whose answers all fall inside `window` is
 /// allowed to have produced.
 ///
@@ -222,19 +260,27 @@ fn moving_the_picture_costs_placements_and_not_pixels() {
     // as the resize having sent pixels.
     settle(&term);
 
-    let before = tiles_drawn(&term);
+    let out = term.output();
+    let before = count(&out, DREW);
+    let offset = out.len();
     term.resize(202, 50, 1616, 850);
-    assert!(
-        term.wait_for(b"a=p,", Duration::from_secs(10)),
-        "the picture was never put on its new cells: {}",
-        tail(&term.output())
-    );
+    let timeout = Duration::from_secs(10);
+    let placed = term
+        .wait_for_after(offset, b"a=p,", timeout)
+        .unwrap_or_else(|| {
+            panic!(
+                "the picture was never put on its new cells: {}",
+                tail(&term.output())
+            )
+        });
+    term.wait_for_after(placed, END_SYNC, timeout)
+        .expect("the frame that moved the picture never finished");
 
     // In the frame that moved it, and that frame alone: the placements go out ahead of
     // whatever the compose has to say, so a move with nothing to send is a frame with no
     // transmission in it at all.
     let out = term.output();
-    let moved = frame_containing(&out, b"a=p,").expect("no frame carried the move");
+    let moved = frame_containing(&out[offset..], b"a=p,").expect("no frame carried the move");
     assert!(
         !contains(moved, DREW),
         "moving the picture sent pixels too: {}",

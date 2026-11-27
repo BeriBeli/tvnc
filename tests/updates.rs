@@ -38,7 +38,7 @@ fn a_frame_is_never_composed_from_half_an_update() {
         },
         (1024, 768),
         &[],
-        &[("DESKTUI_MAX_PARTIAL_WAIT_MS", "60000")],
+        &[("TVNC_MAX_PARTIAL_WAIT_MS", "60000")],
     );
     // From the settled session on, not from the first frame. Until the server has granted
     // the size and the client has adopted it, the picture on screen is *meant* to be in
@@ -92,11 +92,10 @@ fn a_frame_is_never_composed_from_half_an_update() {
     term.wait(Duration::from_secs(10));
 }
 
-/// The first image id that is not a tile's. Above it are the overlay backdrops and the
-/// pointer, which are transmitted like tiles and are not tiles.
-const OVERLAY_ID: u32 = 0x7600 + 0x40000;
+/// Image ids at or above this boundary are reserved for the pointer.
+const TILE_ID_END: u32 = 0x7600 + 0x40000;
 
-/// Every image id transmitted in `out`, tiles and overlays alike.
+/// All image ids transmitted in `out`, including the pointer.
 fn transmitted_ids(out: &[u8]) -> Vec<u32> {
     let mut found = Vec::new();
     for at in offsets(out, b"\x1b_Ga=T") {
@@ -259,10 +258,7 @@ fn the_statistics_say_what_the_other_end_is_doing() {
     );
     assert_drew(&term, Duration::from_secs(10));
 
-    // Ctrl+A then c turns the figures on.
-    term.send(&[0x01]);
-    std::thread::sleep(Duration::from_millis(50));
-    term.send(b"c");
+    term.send(b"\x1b[19~c\x1b[27u"); // Toggle statistics, then return to the desktop.
     assert!(
         wait_for_text(&term, "up/s", Duration::from_secs(10)),
         "the bar never reported an update rate: {}",
@@ -556,7 +552,7 @@ fn the_round_trip_is_measured_with_a_fence_once_frames_are_pushed() {
     // server's own fence.
     let probe = server
         .wait_for(Duration::from_secs(10), |r| match r {
-            Request::Fence { payload, .. } => payload == b"desktui-rtt",
+            Request::Fence { payload, .. } => payload == b"tvnc-rtt",
             _ => false,
         })
         .expect("no latency probe was sent");
@@ -671,7 +667,7 @@ fn the_cursor_shape_is_requested_and_drawn_locally() {
     );
     let tiles: Vec<u32> = transmitted_ids(since)
         .into_iter()
-        .filter(|id| *id < OVERLAY_ID)
+        .filter(|id| *id < TILE_ID_END)
         .collect();
     assert!(
         tiles.is_empty(),

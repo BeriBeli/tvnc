@@ -1,43 +1,20 @@
-//! The command menu: the overlay listing the prefix-key commands, and the piece of
-//! chrome with more than one thing on it you can point at.
+//! The viewer's local command menu. Its layout also defines the clickable targets.
 //!
-//! Laid out with ratatui, but not driven by it. A ratatui `Terminal` owns the
-//! screen and diffs its way to the next one, which would put it in charge of the
-//! cells our graphics placements live in -- the one thing this renderer cannot
-//! give away. So the widgets render into a `Buffer` the exact size of the box and
-//! that buffer is serialised to escapes here, leaving every other cell alone.
-//!
-//! What ratatui is actually for is the part that was hand-rolled before: padding,
-//! alignment, styled spans, and a hit test that comes out of the same geometry the
-//! drawing used, so a click cannot land on a row the box is not showing.
+//! The widgets draw into the shared chrome buffer. The same layout determines
+//! which command or option a pointer can select.
+
+use std::ops::Range;
 
 use ratatui::buffer::Buffer;
-use ratatui::layout::{Position, Rect};
+use ratatui::layout::{Margin, Position, Rect};
 use ratatui::style::{Modifier, Style};
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Padding, Widget};
+use ratatui::widgets::Widget;
 
-use super::chrome::Chrome;
 use super::theme::{Palette, Theme, colour};
-use crate::cli::ScaleMode;
+use crate::cli::{MenuKey, ScaleMode};
+use crate::term::Metrics;
 use crate::term::input::Command;
-use crate::term::{Metrics, kitty};
-
-// Every colour comes from the palette (see `ui::theme`), and each one is needed
-// twice over, because one way is not enough.
-//
-// The cell colours are the whole story in a terminal with no graphics protocol,
-// which `--force` allows, and are why the box looks right in Terminal.app or
-// Alacritty.
-//
-// Where the protocol does work the cell colour is invisible. Tiles are placed at
-// `z=-1` (see `term::kitty`): below the text, but *above* the cell background, so
-// a colour set there is painted under the remote screen and only the glyphs come
-// out on top -- dark text adrift on the wallpaper. Probing Ghostty settled it:
-// reverse video, an explicit `48;` pair and the basic pairs were every one of them
-// buried, and only an image of our own -- same z-index, higher id than any tile --
-// was composited over the desktop. So the backdrop and the highlight bar are
-// images, and the text is written on them.
 
 /// Breathing room inside the box, in cells. There is no border to hold the text
 /// off the edge, so the padding is the only thing that does.
@@ -52,26 +29,24 @@ const CHOICE_GAP: u16 = 2;
 
 /// One line of the menu.
 enum Entry {
-    /// Heading of the whole box: its name, and how to leave. The second is a
-    /// target as well as a label, being the one thing in here that always ends the
-    /// menu rather than doing something and leaving it up.
+    /// The menu title and its clickable close button.
     Title {
-        name: String,
-        close: String,
+        name: &'static str,
+        close: &'static str,
     },
     /// A group of commands.
-    Section(String),
+    Section(&'static str),
     /// A command, the keys that reach it, and what a click on it runs.
     Item {
-        label: String,
-        keys: String,
+        label: &'static str,
+        keys: &'static str,
         command: Command,
     },
     /// A row of alternatives, exactly one of which is in force. Which one that is
     /// arrives at draw time; the row itself only knows what is on offer.
     Choice {
         options: Vec<Option_>,
-        keys: String,
+        keys: &'static str,
     },
     Blank,
 }
@@ -151,14 +126,20 @@ fn choice_width(options: &[Option_]) -> u16 {
 }
 
 impl Entry {
-    /// Columns this line needs, before padding.
-    fn width(&self) -> u16 {
+    /// Minimum width for the clickable labels, and preferred width with shortcuts.
+    fn widths(&self) -> (u16, u16) {
         match self {
-            Entry::Blank => 0,
-            Entry::Section(text) => cells(text),
-            Entry::Title { name, close } => cells(name) + GAP + cells(close),
-            Entry::Item { label, keys, .. } => cells(label) + GAP + cells(keys),
-            Entry::Choice { options, keys } => choice_width(options) + GAP + cells(keys),
+            Entry::Blank => (0, 0),
+            Entry::Section(text) => (cells(text), cells(text)),
+            Entry::Title { name, close } => {
+                let width = cells(name) + GAP + cells(close);
+                (width, width)
+            }
+            Entry::Item { label, keys, .. } => (cells(label), cells(label) + GAP + cells(keys)),
+            Entry::Choice { options, keys } => {
+                let width = choice_width(options);
+                (width, width + GAP + cells(keys))
+            }
         }
     }
 
@@ -186,10 +167,8 @@ impl Entry {
     }
 }
 
-/// Width of a label in cells. Every one is a short ASCII literal from this file,
-/// so the cast cannot lose anything.
 fn cells(text: &str) -> u16 {
-    text.chars().count() as u16
+    Span::raw(text).width() as u16
 }
 
 /// What sits under the pointer.
@@ -203,9 +182,20 @@ pub enum Hit {
     Item { index: usize, command: Command },
 }
 
+/// The geometry and first entry used to draw one frame of the menu.
+#[derive(Clone, Copy, PartialEq, Eq)]
+pub struct Viewport {
+    area: Rect,
+    inner: Rect,
+    first_row: usize,
+}
+
 /// The menu and what the pointer is on.
 pub struct Menu {
     entries: Vec<Entry>,
+    label_width: u16,
+    preferred_width: u16,
+    first_row: usize,
     /// The entry under the pointer and the command it would run, which is only ever
     /// one a click would act on. The command is kept because a row of options has
     /// several, and the highlight has to know which.
@@ -213,43 +203,35 @@ pub struct Menu {
 }
 
 impl Menu {
-    pub fn new(prefix: char) -> Self {
-        let p = format!("ctrl+{}", prefix.to_ascii_lowercase());
-        let item = |label: &str, keys: String, command| Entry::Item {
-            label: label.to_string(),
+    pub fn new(menu_key: MenuKey) -> Self {
+        let item = |label, keys, command| Entry::Item {
+            label,
             keys,
             command,
         };
         let entries = vec![
             Entry::Title {
-                name: "Command menu".into(),
-                close: super::CLOSE.into(),
+                name: "Command menu",
+                close: super::CLOSE,
             },
             Entry::Blank,
-            Entry::Section("Session".into()),
-            // First, and the only line that names the binding that opened the box.
-            // Clicking it closes the box, which is what toggling something already
-            // showing means.
-            item("Toggle command menu", format!("{p} p"), Command::Menu),
-            item("Quit", format!("{p} q"), Command::Quit),
+            Entry::Section("Session"),
+            match menu_key {
+                MenuKey::F8 => item("Send F8 to remote", "8", Command::SendF8),
+                MenuKey::None => item("Close menu", "Esc", Command::Menu),
+            },
+            item("Quit", "q", Command::Quit),
             Entry::Blank,
-            Entry::Section("Screen".into()),
-            item("Refresh in full", format!("{p} f"), Command::FullRefresh),
-            item(
-                "Renegotiate the remote size",
-                format!("{p} r"),
-                Command::Renegotiate,
-            ),
-            // One line each rather than one that says "arrows". A click can only mean
-            // one direction, and the menu closing after it is what the keyboard does
-            // too: the prefix disarms after a single command, so panning twice is two
-            // chords there as it is two clicks here.
-            item("Pan left", format!("{p} left"), Command::Pan(-1, 0)),
-            item("Pan right", format!("{p} right"), Command::Pan(1, 0)),
-            item("Pan up", format!("{p} up"), Command::Pan(0, -1)),
-            item("Pan down", format!("{p} down"), Command::Pan(0, 1)),
+            Entry::Section("Screen"),
+            item("Refresh in full", "f", Command::FullRefresh),
+            item("Renegotiate the remote size", "r", Command::Renegotiate),
+            // Give each direction its own click target.
+            item("Pan left", "left", Command::Pan(-1, 0)),
+            item("Pan right", "right", Command::Pan(1, 0)),
+            item("Pan up", "up", Command::Pan(0, -1)),
+            item("Pan down", "down", Command::Pan(0, 1)),
             Entry::Blank,
-            Entry::Section("Scaling".into()),
+            Entry::Section("Scaling"),
             // One row rather than four commands: the key steps through the modes
             // because a single binding cannot name one, but a click can, so the
             // options are offered side by side with the one in force marked.
@@ -272,10 +254,10 @@ impl Menu {
                         command: Command::Mode(ScaleMode::OneToOne),
                     },
                 ],
-                keys: format!("{p} m"),
+                keys: "m",
             },
             Entry::Blank,
-            Entry::Section("Theme".into()),
+            Entry::Section("Theme"),
             // No keys: two of anything is a choice rather than a cycle, and a click
             // names one where a single binding could only alternate.
             Entry::Choice {
@@ -289,19 +271,24 @@ impl Menu {
                         command: Command::Theme(Theme::Light),
                     },
                 ],
-                keys: String::new(),
+                keys: "",
             },
             Entry::Blank,
-            Entry::Section("View".into()),
-            item(
-                "Toggle view-only",
-                format!("{p} v"),
-                Command::ToggleViewOnly,
-            ),
-            item("Toggle statistics", format!("{p} c"), Command::ToggleStats),
+            Entry::Section("View"),
+            item("Toggle view-only", "v", Command::ToggleViewOnly),
+            item("Toggle statistics", "c", Command::ToggleStats),
         ];
+        let (min_width, preferred_width) = entries
+            .iter()
+            .map(Entry::widths)
+            .fold((0, 0), |(min, preferred), (label, full)| {
+                (min.max(label), preferred.max(full))
+            });
         Self {
             entries,
+            label_width: min_width,
+            preferred_width: preferred_width + 2 * PAD_X,
+            first_row: 0,
             hover: None,
         }
     }
@@ -311,14 +298,13 @@ impl Menu {
     ///
     /// Everything -- drawing, erasing and hit testing -- comes through here, so
     /// the three cannot disagree about which cells the menu owns.
-    fn area(&self, metrics: &Metrics) -> Option<Rect> {
-        let inner = self.entries.iter().map(Entry::width).max().unwrap_or(0);
-        let width = inner + PAD_X * 2;
-        let height = u16::try_from(self.entries.len()).ok()? + PAD_Y * 2;
+    pub fn area(&self, metrics: &Metrics) -> Option<Rect> {
         let rows = metrics.image_rows();
-        if width > metrics.cols || height > rows {
+        if metrics.cols == 0 || rows == 0 {
             return None;
         }
+        let width = metrics.cols.min(self.preferred_width);
+        let height = rows.min(self.entries.len() as u16 + PAD_Y * 2);
         Some(Rect {
             x: (metrics.cols - width) / 2,
             y: (rows - height) / 2,
@@ -327,21 +313,51 @@ impl Menu {
         })
     }
 
-    /// The cells the highlight covers, which is what the bar is placed over and
-    /// what the cells behind it are coloured -- one function, so the image and the
-    /// colour cannot land on different cells.
+    /// Drop vertical padding before clipping any entries. Drawing and hit
+    /// testing use the same slice, including after a resize or wheel event.
+    fn visible_rows(&self, area: Rect) -> (Rect, Range<usize>) {
+        let count = self.entries.len();
+        let pad_y = PAD_Y.min(area.height.saturating_sub(count as u16) / 2);
+        let pad_x = PAD_X.min(area.width.saturating_sub(self.label_width) / 2);
+        let inner = area.inner(Margin::new(pad_x, pad_y));
+        let visible = count.min(usize::from(inner.height));
+        let start = self.first_row.min(count - visible);
+        (inner, start..start + visible)
+    }
+
+    pub fn scroll(&mut self, metrics: &Metrics, down: bool) {
+        if let Some(area) = self.area(metrics) {
+            let (_, rows) = self.visible_rows(area);
+            self.first_row = if down {
+                (rows.start + 1).min(self.entries.len() - rows.len())
+            } else {
+                rows.start.saturating_sub(1)
+            };
+        }
+    }
+
+    pub fn reset(&mut self) {
+        self.first_row = 0;
+        self.clear_hover();
+    }
+
+    /// The cells to highlight for the hovered command.
     ///
     /// A command's target is its whole row, and a bar across the row is the answer. An
     /// option's is the option itself, that row holding several, and a bar across all of it
     /// would say the pointer is on things it is not. The title's button gets no bar at all.
     fn hover_bar(&self, area: Rect) -> Option<Rect> {
         let (index, command) = self.hover?;
-        let y = area.y + PAD_Y + u16::try_from(index).ok()?;
+        let (inner, rows) = self.visible_rows(area);
+        if !rows.contains(&index) {
+            return None;
+        }
+        let y = inner.y + (index - rows.start) as u16;
         let span = |start: u16, width: u16| {
-            Some(Rect {
-                x: area.x + PAD_X + start,
+            (start < inner.width).then(|| Rect {
+                x: inner.x + start,
                 y,
-                width,
+                width: width.min(inner.width - start),
                 height: 1,
             })
         };
@@ -381,7 +397,26 @@ impl Menu {
 
     /// What a pointer at zero-based cell `(col, row)` is on.
     pub fn hit(&self, metrics: &Metrics, col: u16, row: u16) -> Hit {
-        let Some(area) = self.area(metrics) else {
+        self.hit_in(self.viewport(metrics), col, row)
+    }
+
+    fn viewport(&self, metrics: &Metrics) -> Option<Viewport> {
+        let area = self.area(metrics)?;
+        let (inner, rows) = self.visible_rows(area);
+        Some(Viewport {
+            area,
+            inner,
+            first_row: rows.start,
+        })
+    }
+
+    pub fn hit_in(&self, viewport: Option<Viewport>, col: u16, row: u16) -> Hit {
+        let Some(Viewport {
+            area,
+            inner,
+            first_row,
+        }) = viewport
+        else {
             return Hit::Outside;
         };
         if !area.contains(Position::new(col, row)) {
@@ -389,66 +424,32 @@ impl Menu {
         }
         // Above the first entry the subtraction underflows, and below the last one
         // there is no entry to find.
-        let Some(index) = row.checked_sub(area.y + PAD_Y).map(usize::from) else {
+        if row < inner.y || row >= inner.bottom() {
             return Hit::Inside;
-        };
+        }
+        let index = first_row + usize::from(row - inner.y);
         let Some(entry) = self.entries.get(index) else {
             return Hit::Inside;
         };
         // Counted from where the text starts, so the padding comes out negative: it
         // belongs to a command's row, but to no single option on a row of them.
-        let offset = i32::from(col) - i32::from(area.x + PAD_X);
-        match entry.command_at(offset, area.width.saturating_sub(PAD_X * 2)) {
+        let offset = i32::from(col) - i32::from(inner.x);
+        match entry.command_at(offset, inner.width) {
             Some(command) => Hit::Item { index, command },
             None => Hit::Inside,
         }
     }
 
-    /// Draw the menu, centred over the remote screen.
-    ///
-    /// `state` says which option each row of them should mark as in force.
-    ///
-    /// No border: the box is held off the remote screen by its padding and its own
-    /// backdrop, which is a good deal quieter than a rule around the outside.
-    pub fn render(&self, chrome: &mut Chrome, out: &mut Vec<u8>, metrics: &Metrics, state: State) {
-        let Some(area) = self.area(metrics) else {
-            return;
-        };
-
-        // The backdrop and the highlight first, then the text on top of them. All
-        // three go out after the frame's tiles, but it is the image id rather than
-        // the order that keeps them above: at equal z-index the higher id wins.
-        kitty::place_solid(
-            out,
-            kitty::OVERLAY_IMAGE_ID,
-            usize::from(area.x) + 1,
-            usize::from(area.y) + 1,
-            usize::from(area.width),
-            usize::from(area.height),
-            state.theme.palette().paper,
-        );
-        // The bar moves with the pointer, and every placement releases the one it
-        // replaces (see `term::kitty`), so a row the pointer has left keeps nothing.
-        // Only the case with no bar at all needs saying here: nothing is placed, so
-        // nothing releases the last one, and it would sit there until the menu closed.
-        chrome.keep(kitty::OVERLAY_IMAGE_ID);
-        // A row the pointer has left keeps nothing: every placement releases the one it
-        // replaces. The case with no bar at all is the chrome's to clean up, which is what
-        // declaring it only when there is one comes to.
-        if let Some(bar) = self.hover_bar(area) {
-            kitty::place_solid(
-                out,
-                kitty::MENU_HIGHLIGHT_IMAGE_ID,
-                usize::from(bar.x) + 1,
-                usize::from(bar.y) + 1,
-                usize::from(bar.width),
-                usize::from(bar.height),
-                state.theme.palette().hover,
-            );
-            chrome.keep(kitty::MENU_HIGHLIGHT_IMAGE_ID);
+    /// Draw the menu and its current selections over the remote screen.
+    pub fn render(&self, buf: &mut Buffer, metrics: &Metrics, state: State) -> Option<Viewport> {
+        let viewport = self.viewport(metrics)?;
+        MenuView {
+            menu: self,
+            state,
+            viewport,
         }
-
-        MenuView { menu: self, state }.render(area, chrome.buffer());
+        .render(viewport.area, buf);
+        Some(viewport)
     }
 }
 
@@ -458,50 +459,33 @@ impl Menu {
 struct MenuView<'a> {
     menu: &'a Menu,
     state: State,
+    viewport: Viewport,
 }
 
 impl Widget for MenuView<'_> {
     fn render(self, area: Rect, buf: &mut Buffer) {
         let ink = self.state.theme.palette();
-        let block = Block::new()
-            .padding(Padding::symmetric(PAD_X, PAD_Y))
-            .style(Style::new().bg(colour(ink.paper)).fg(colour(ink.ink)));
-        let inner = block.inner(area);
-        block.render(area, buf);
+        let inner = self.viewport.inner;
+        let rows = self.viewport.first_row..self.menu.entries.len();
+        buf.set_style(area, Style::new().bg(colour(ink.paper)).fg(colour(ink.ink)));
 
-        // The cells under the highlight, coloured for a terminal with no graphics
-        // protocol. The same rectangle the bar image is placed over.
         if let Some(bar) = self.menu.hover_bar(area) {
             buf.set_style(bar, Style::new().bg(colour(ink.hover)));
         }
 
-        for (index, entry) in self.menu.entries.iter().enumerate() {
-            let Some(y) = u16::try_from(index).ok().map(|i| inner.y + i) else {
-                break;
-            };
-            if y >= inner.bottom() {
-                break;
-            }
-            let row = Rect {
-                x: inner.x,
-                y,
-                width: inner.width,
-                height: 1,
-            };
+        for (index, row) in rows.zip(inner.rows()) {
+            let entry = &self.menu.entries[index];
             let hovered = |command| self.menu.hover == Some((index, command));
 
             match entry {
                 Entry::Blank => {}
                 Entry::Section(text) => {
-                    Line::from(Span::styled(
-                        text.as_str(),
-                        Style::new().fg(colour(ink.accent)),
-                    ))
-                    .render(row, buf);
+                    Line::from(Span::styled(*text, Style::new().fg(colour(ink.accent))))
+                        .render(row, buf);
                 }
                 Entry::Title { name, close } => {
                     Line::from(Span::styled(
-                        name.as_str(),
+                        *name,
                         Style::new()
                             .fg(colour(ink.ink))
                             .add_modifier(Modifier::BOLD),
@@ -512,7 +496,7 @@ impl Widget for MenuView<'_> {
                     // styling is the palette's rather than this file's, the popup
                     // carrying the same button (see `toast`).
                     let style = ink.close_button(hovered(Command::Menu));
-                    Line::from(Span::styled(close.as_str(), style))
+                    Line::from(Span::styled(*close, style))
                         .right_aligned()
                         .render(row, buf);
                 }
@@ -532,6 +516,9 @@ impl Widget for MenuView<'_> {
                 }
                 Entry::Choice { options, keys } => {
                     for (option, start, _) in option_spans(options) {
+                        if start >= row.width {
+                            break;
+                        }
                         // Brackets on the one in force, blanks on the rest, so every
                         // option is the same width whichever is selected and the
                         // options do not shuffle sideways as it changes.
@@ -555,17 +542,16 @@ impl Widget for MenuView<'_> {
                         };
                         let at = Rect {
                             x: row.x + start,
-                            width: option.width(),
+                            width: option.width().min(row.width - start),
                             ..row
                         };
                         Line::from(Span::styled(text, style)).render(at, buf);
                     }
-                    Line::from(Span::styled(
-                        keys.as_str(),
-                        Style::new().fg(colour(ink.muted)),
-                    ))
-                    .right_aligned()
-                    .render(row, buf);
+                    if !keys.is_empty() && choice_width(options) + cells(keys) < row.width {
+                        Line::from(Span::styled(*keys, Style::new().fg(colour(ink.muted))))
+                            .right_aligned()
+                            .render(row, buf);
+                    }
                 }
             }
         }
@@ -578,7 +564,7 @@ impl Widget for MenuView<'_> {
 /// the whole row it is given and the second one would repaint the first.
 fn split(buf: &mut Buffer, row: Rect, left: &str, right: &str, style: Style, ink: &Palette) {
     Line::from(Span::styled(left, style)).render(row, buf);
-    if !right.is_empty() {
+    if !right.is_empty() && cells(left) + cells(right) < row.width {
         Line::from(Span::styled(right, Style::new().fg(colour(ink.muted))))
             .right_aligned()
             .render(row, buf);
@@ -588,13 +574,14 @@ fn split(buf: &mut Buffer, row: Rect, left: &str, right: &str, style: Style, ink
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::chrome::Chrome;
 
     /// Render the menu the way a frame does -- into the chrome's plane -- and serialise
     /// what came out, so the assertions below can go on reading escapes.
     fn draw_menu(menu: &Menu, out: &mut Vec<u8>, m: &Metrics, state: State) {
         let mut chrome = Chrome::new();
         chrome.begin(m);
-        menu.render(&mut chrome, out, m, state);
+        menu.render(chrome.buffer(), m, state);
         chrome.flush(out);
     }
     use crate::cli::ScaleMode;
@@ -681,49 +668,77 @@ mod tests {
 
     #[test]
     fn menu_fits_or_is_skipped() {
-        let menu = Menu::new('a');
+        let menu = Menu::new(MenuKey::F8);
         let mut out = Vec::new();
         draw_menu(&menu, &mut out, &metrics(100, 40), state());
         assert!(!out.is_empty());
 
         out.clear();
-        draw_menu(&menu, &mut out, &metrics(20, 6), state());
+        draw_menu(&menu, &mut out, &metrics(20, 1), state());
         assert!(out.is_empty(), "must not draw a menu that does not fit");
     }
 
     #[test]
-    fn menu_carries_its_own_background() {
-        // Tiles sit at z=-1: below the text, but above the cell background, so no
-        // SGR fill can be seen behind the glyphs. The backdrop has to be an image
-        // of our own, outranking every tile id so it is composited over them.
-        let menu = Menu::new('a');
+    fn a_narrow_menu_keeps_the_last_scaling_option_visible_and_clickable() {
+        let m = metrics(45, 24);
+        let menu = Menu::new(MenuKey::F8);
+        let area = menu.area(&m).unwrap();
         let mut out = Vec::new();
-        draw_menu(&menu, &mut out, &metrics(100, 40), state());
-        let text = String::from_utf8(out).unwrap();
-        assert!(
-            text.contains(&format!("i={},", kitty::OVERLAY_IMAGE_ID)),
-            "the menu must place a backdrop image, not colour its cells"
-        );
-        assert!(
-            text.contains("z=-1"),
-            "the backdrop shares the tiles' z-index; above it would cover the text"
-        );
-        assert!(
-            text.contains(&bg(state().theme.palette().paper)),
-            "the cells are coloured too, for a terminal with no graphics protocol"
-        );
-        assert!(
-            !text.contains("\x1b[7m"),
-            "reverse video would follow the theme, and is buried by the image anyway"
-        );
-        // The backdrop goes down before the text that sits on it.
-        let backdrop = text.find("\x1b_Ga=T").expect("no backdrop");
-        assert!(backdrop < text.find("Command menu").expect("no title"));
+        draw_menu(&menu, &mut out, &m, state());
+        let lines = rendered(&out);
+        let (row, choices) = lines
+            .iter()
+            .enumerate()
+            .find(|(_, line)| line.contains("Native"))
+            .unwrap();
+        let col = choices
+            .find("1:1")
+            .expect("shortcut covered the last option");
+        assert!(matches!(
+            menu.hit(&m, area.x + col as u16, area.y + row as u16),
+            Hit::Item {
+                command: Command::Mode(ScaleMode::OneToOne),
+                ..
+            }
+        ));
+    }
+
+    fn assert_menu_background(buf: &Buffer, area: Rect, hover: Option<Rect>, theme: Theme) {
+        let palette = theme.palette();
+        for pos in buf.area.positions() {
+            let expected = if hover.is_some_and(|rect| rect.contains(pos)) {
+                colour(palette.hover)
+            } else if area.contains(pos) {
+                colour(palette.paper)
+            } else {
+                ratatui::style::Color::Reset
+            };
+            assert_eq!(buf[pos].bg, expected, "cell at {pos:?}");
+        }
+    }
+
+    #[test]
+    fn every_cell_inside_the_menu_covers_the_desktop_in_both_themes() {
+        let m = Metrics {
+            cols: 138,
+            rows: 40,
+            px_w: 2484,
+            px_h: 1600,
+            cell_w: 18,
+            cell_h: 40,
+        };
+        let menu = Menu::new(MenuKey::F8);
+        let area = menu.area(&m).unwrap();
+        for theme in [Theme::Dark, Theme::Light] {
+            let mut buf = Buffer::empty(Rect::new(0, 0, m.cols, m.rows));
+            menu.render(&mut buf, &m, State { theme, ..state() });
+            assert_menu_background(&buf, area, None, theme);
+        }
     }
 
     #[test]
     fn menu_is_padded_and_right_aligns_its_shortcuts() {
-        let menu = Menu::new('a');
+        let menu = Menu::new(MenuKey::F8);
         let mut out = Vec::new();
         draw_menu(&menu, &mut out, &metrics(100, 40), state());
         let lines = rendered(&out);
@@ -751,16 +766,15 @@ mod tests {
             );
         }
         // Every shortcut ends in the same column.
-        let ends: Vec<usize> = lines
-            .iter()
-            .filter(|l| l.contains("ctrl+a"))
-            .map(|l| l.trim_end().chars().count())
-            .collect();
-        assert!(ends.len() > 5, "expected the shortcut list");
-        assert!(
-            ends.iter().all(|e| *e == ends[0]),
-            "shortcuts are not flush right: {ends:?}"
-        );
+        for (row, entry) in menu.entries.iter().enumerate() {
+            if let Entry::Item { keys, .. } | Entry::Choice { keys, .. } = entry
+                && !keys.is_empty()
+            {
+                let line = lines[row + usize::from(PAD_Y)].trim_end();
+                assert_eq!(line.split_whitespace().last(), Some(*keys));
+                assert_eq!(line.chars().count(), width - usize::from(PAD_X));
+            }
+        }
     }
 
     #[test]
@@ -769,16 +783,16 @@ mod tests {
         // below the text: the cells have to be blanked, over exactly the rectangle that was
         // drawn, or a frame of it survives. Nothing asks for that any more -- the menu is
         // simply not rendered, and the plane's diff works out the rest.
-        let mut menu = Menu::new('a');
+        let mut menu = Menu::new(MenuKey::F8);
         let m = metrics(100, 40);
-        // Pointed at, so the hover bar is placed too and both images have to go.
+        // Include a highlighted row in the area to clear.
         let area = menu.area(&m).expect("the menu did not fit");
         menu.set_hover(menu.hit(&m, area.x + PAD_X, area.y + PAD_Y + 3));
         let mut chrome = Chrome::new();
 
         chrome.begin(&m);
         let mut drawn = Vec::new();
-        menu.render(&mut chrome, &mut drawn, &m, state());
+        menu.render(chrome.buffer(), &m, state());
         chrome.flush(&mut drawn);
         chrome.commit();
 
@@ -800,18 +814,14 @@ mod tests {
             cells(&cleared),
             "the erase must cover the same cells the menu drew"
         );
-        assert!(
-            !vacated.is_empty(),
-            "and hand them back as damage, so the picture under them is drawn again"
+        assert_eq!(
+            vacated,
+            area.positions()
+                .map(|p| Rect::new(p.x, p.y, 1, 1))
+                .collect::<Vec<_>>(),
+            "every menu cell, including the blank padding, should reveal the desktop"
         );
         let text = String::from_utf8(cleared).unwrap();
-        for id in [kitty::OVERLAY_IMAGE_ID, kitty::MENU_HIGHLIGHT_IMAGE_ID] {
-            assert!(
-                text.contains(&format!("a=d,d=I,i={id}")),
-                "image {id} outranks every tile and has to be deleted too"
-            );
-        }
-        // Nothing but blanks and the image deletes: a leftover border would still be there.
         let written: String = text
             .split("\x1b[")
             .skip(1)
@@ -827,11 +837,11 @@ mod tests {
     #[test]
     fn a_menu_that_does_not_fit_leaves_nothing_to_blank() {
         // Otherwise the frame after it would blank a rectangle that was never drawn.
-        let m = metrics(20, 6);
+        let m = metrics(20, 1);
         let mut chrome = Chrome::new();
         chrome.begin(&m);
         let mut out = Vec::new();
-        Menu::new('a').render(&mut chrome, &mut out, &m, state());
+        Menu::new(MenuKey::F8).render(chrome.buffer(), &m, state());
         chrome.flush(&mut out);
         chrome.commit();
 
@@ -843,11 +853,10 @@ mod tests {
 
     #[test]
     fn menu_never_touches_the_status_row() {
-        // Big enough that the menu actually draws: at 20 rows it does not fit and
-        // the check below would pass by having nothing to look at.
-        let m = metrics(100, 40);
+        let m = metrics(80, 24);
         let mut out = Vec::new();
-        draw_menu(&Menu::new('a'), &mut out, &m, state());
+        draw_menu(&Menu::new(MenuKey::F8), &mut out, &m, state());
+        assert!(!out.is_empty());
         let text = String::from_utf8(out).unwrap();
         // Every cursor move must stay above the last row. Only sequences that
         // actually terminate in `H` are positions: the colour set-up ends in `m`,
@@ -868,7 +877,7 @@ mod tests {
         let index = menu
             .entries
             .iter()
-            .position(|e| matches!(e, Entry::Item { label: l, .. } if l == label))
+            .position(|e| matches!(e, Entry::Item { label: l, .. } if *l == label))
             .expect("no such item");
         area.y + PAD_Y + u16::try_from(index).unwrap()
     }
@@ -889,23 +898,21 @@ mod tests {
 
     #[test]
     fn a_click_on_a_row_finds_that_rows_command() {
-        let menu = Menu::new('a');
+        let menu = Menu::new(MenuKey::F8);
         let m = metrics(100, 40);
         let area = menu.area(&m).unwrap();
-        // The menu's own toggle comes first, so the binding that opened the box is
-        // the first thing in it.
+        // The first action sends the reserved F8 to the server.
         assert_eq!(
             menu.hit(&m, area.x, area.y + PAD_Y + 3),
             Hit::Item {
                 index: 3,
-                command: Command::Menu
+                command: Command::SendF8
             },
-            "the first item is no longer the menu's own toggle"
+            "the first item must send F8"
         );
 
         for (label, want) in [
-            // The first row, and the only one whose command acts on the menu itself.
-            ("Toggle command menu", Command::Menu),
+            ("Send F8 to remote", Command::SendF8),
             ("Quit", Command::Quit),
             ("Toggle view-only", Command::ToggleViewOnly),
             ("Refresh in full", Command::FullRefresh),
@@ -927,7 +934,7 @@ mod tests {
 
     #[test]
     fn the_button_in_the_title_is_a_target_and_the_name_beside_it_is_not() {
-        let mut menu = Menu::new('a');
+        let mut menu = Menu::new(MenuKey::F8);
         let m = metrics(100, 40);
         let area = menu.area(&m).unwrap();
         let row = area.y + PAD_Y;
@@ -975,7 +982,7 @@ mod tests {
 
     #[test]
     fn the_padding_and_the_blank_rows_are_not_commands() {
-        let menu = Menu::new('a');
+        let menu = Menu::new(MenuKey::F8);
         let m = metrics(100, 40);
         let area = menu.area(&m).unwrap();
         let col = area.x + area.width / 2;
@@ -1011,7 +1018,7 @@ mod tests {
 
     #[test]
     fn everything_off_the_box_is_outside() {
-        let menu = Menu::new('a');
+        let menu = Menu::new(MenuKey::F8);
         let m = metrics(100, 40);
         let area = menu.area(&m).unwrap();
         for (col, row) in [
@@ -1025,135 +1032,34 @@ mod tests {
             assert_eq!(menu.hit(&m, col, row), Hit::Outside, "{col},{row}");
         }
         // A menu that does not fit was never drawn, so no cell belongs to it.
-        assert_eq!(menu.hit(&metrics(20, 6), 10, 3), Hit::Outside);
+        assert_eq!(menu.hit(&metrics(20, 1), 10, 0), Hit::Outside);
     }
 
     #[test]
-    fn the_hovered_row_is_highlighted_and_the_others_are_not() {
+    fn moving_or_leaving_a_command_highlights_only_its_current_row() {
         let m = metrics(100, 40);
-        let mut menu = Menu::new('a');
-        let row = row_of(&menu, &m, "Quit");
-        menu.set_hover(menu.hit(&m, m.cols / 2, row));
-
-        let mut out = Vec::new();
-        draw_menu(&menu, &mut out, &m, state());
-        let text = String::from_utf8(out).unwrap();
-        // A bar the pointer's row wide, drawn as an image with an id above the
-        // backdrop's: a cell background would be buried, and a lower id would put
-        // the bar under the very thing it has to be seen on.
-        assert!(
-            bar_command(&text, "a=T").is_some(),
-            "the highlight must be an image; a cell background is buried"
-        );
-        assert!(
-            text.contains(&bg(state().theme.palette().hover)),
-            "the cells are coloured too, for a terminal with no graphics protocol"
-        );
-        // And on the row that was pointed at, not merely somewhere on the box: the
-        // hit test and the drawing have to agree about which entry is which.
+        let mut menu = Menu::new(MenuKey::F8);
         let area = menu.area(&m).unwrap();
-        let cup = positions(&text.as_bytes()[..placement(&text)])
-            .pop()
-            .expect("no cursor move");
-        assert_eq!(
-            cup,
-            (row + 1, area.x + 1),
-            "the bar is not on the row the pointer hit"
-        );
-        assert!(
-            text.contains(&format!(",c={},r=1;", area.width)),
-            "the bar must be one row tall and the width of the box"
-        );
-        // The placement releases the one it replaces, which is what stops the row the
-        // pointer came from keeping its stripe. `term::kitty` emits it and tests it;
-        // this only asks that the bar go through the path that does.
-        assert!(
-            bar_command(&text, "a=d").is_some_and(|release| release < placement(&text)),
-            "the bar must release its last placement before making another"
-        );
-
-        // Pointing at nothing takes it away and puts nothing back. Nothing is placed, so
-        // nothing releases the last placement either, and only a delete can do it -- which
-        // is the chrome's, at the end of a frame that did not ask for the bar. So this needs
-        // the same plane across both frames, as a session has.
         let mut chrome = Chrome::new();
-        chrome.begin(&m);
-        let mut out = Vec::new();
-        menu.render(&mut chrome, &mut out, &m, state());
-        chrome.flush(&mut out);
-        chrome.commit();
-
-        chrome.begin(&m);
-        let mut out = Vec::new();
-        menu.set_hover(Hit::Outside);
-        menu.render(&mut chrome, &mut out, &m, state());
-        chrome.flush(&mut out);
-        chrome.commit();
-        let text = String::from_utf8(out).unwrap();
-        assert!(!text.contains(&bg(state().theme.palette().hover)));
-        assert!(
-            text.contains(&format!("a=d,d=I,i={}", kitty::MENU_HIGHLIGHT_IMAGE_ID)),
-            "a bar that is no longer wanted has to be deleted, not just left off"
-        );
-        assert!(
-            bar_command(&text, "a=T").is_none(),
-            "nothing to highlight, so nothing to place"
-        );
-    }
-
-    /// Where the graphics command that does `action` to the highlight bar starts.
-    ///
-    /// Matched on the keys rather than by substring, because the placement and the
-    /// release that precedes it both name the same image id, and the keys between
-    /// them are `term::kitty`'s business to order.
-    fn bar_command(text: &str, action: &str) -> Option<usize> {
-        text.match_indices("\x1b_G").find_map(|(at, _)| {
-            let keys = text[at..].split_once(';')?.0;
-            let names_the_bar = keys.contains(&format!("i={},", kitty::MENU_HIGHLIGHT_IMAGE_ID));
-            (keys.contains(action) && names_the_bar).then_some(at)
-        })
-    }
-
-    fn placement(text: &str) -> usize {
-        bar_command(text, "a=T").expect("the bar was never placed")
-    }
-
-    #[test]
-    fn moving_the_highlight_leaves_no_stripe_behind() {
-        // Three entries of one section, which is where this went wrong: the pointer
-        // crosses no heading between them, so nothing clears the row it came from
-        // except the release the new placement carries.
-        let m = metrics(100, 40);
-        let mut menu = Menu::new('a');
-        let col = m.cols / 2;
-        let left = menu.area(&m).unwrap().x + 1;
-        let mut rows = Vec::new();
-        for label in ["Pan left", "Pan right", "Pan up"] {
-            let row = row_of(&menu, &m, label);
-            menu.set_hover(menu.hit(&m, col, row));
+        for target in [Some("Pan left"), Some("Pan right"), Some("Pan up"), None] {
+            let row = target.map(|label| row_of(&menu, &m, label));
+            let hit = row.map_or(Hit::Outside, |y| menu.hit(&m, m.cols / 2, y));
+            menu.set_hover(hit);
+            chrome.begin(&m);
+            menu.render(chrome.buffer(), &m, state());
+            let bar = row.map(|y| Rect::new(area.x, y, area.width, 1));
+            assert_menu_background(chrome.buffer(), area, bar, state().theme);
             let mut out = Vec::new();
-            draw_menu(&menu, &mut out, &m, state());
-            let text = String::from_utf8(out).unwrap();
             assert!(
-                bar_command(&text, "a=d").is_some_and(|release| release < placement(&text)),
-                "{label}: the last placement has to be released before the next is made"
+                chrome.flush(&mut out).is_empty(),
+                "the menu still covers the desktop"
             );
-            // One bar per frame, on this row and no other.
-            assert_eq!(
-                text.matches(&format!("i={},p=", kitty::MENU_HIGHLIGHT_IMAGE_ID))
-                    .count(),
-                2,
-                "{label}: expected one release and one placement"
+            assert!(
+                !out.is_empty(),
+                "the changed highlight must reach the terminal"
             );
-            let cup = positions(&text.as_bytes()[..placement(&text)])
-                .pop()
-                .unwrap();
-            assert_eq!(cup, (row + 1, left), "{label}: the bar is on the wrong row");
-            rows.push(row);
+            chrome.commit();
         }
-        // Adjacent rows, or the test is not exercising the case it claims to.
-        assert_eq!(rows[1], rows[0] + 1);
-        assert_eq!(rows[2], rows[1] + 1);
     }
 
     /// Every option of the scaling row with the column its text starts at.
@@ -1180,7 +1086,7 @@ mod tests {
 
     #[test]
     fn each_scaling_option_is_its_own_target() {
-        let menu = Menu::new('a');
+        let menu = Menu::new(MenuKey::F8);
         let m = metrics(100, 40);
         let (row, left) = choice_row(&menu, &m);
 
@@ -1210,7 +1116,7 @@ mod tests {
     #[test]
     fn the_option_in_force_is_the_marked_one() {
         let m = metrics(100, 40);
-        let menu = Menu::new('a');
+        let menu = Menu::new(MenuKey::F8);
         let (row, _) = choice_row(&menu, &m);
 
         // Whichever mode is in force wears the brackets, and only that one.
@@ -1234,7 +1140,7 @@ mod tests {
                 usize::from(menu.area(&m).unwrap().width)
             );
             assert!(
-                drawn.contains("ctrl+a m"),
+                drawn.split_whitespace().last() == Some("m"),
                 "the key still cycles: {drawn:?}"
             );
         }
@@ -1242,7 +1148,7 @@ mod tests {
 
     #[test]
     fn the_theme_row_marks_the_one_in_force_and_a_click_names_the_other() {
-        let menu = Menu::new('a');
+        let menu = Menu::new(MenuKey::F8);
         let m = metrics(100, 40);
         let index = menu
             .entries
@@ -1285,7 +1191,7 @@ mod tests {
         // A row of four targets cannot take a bar across all of it: that would say
         // the pointer is on things it is not.
         let m = metrics(100, 40);
-        let mut menu = Menu::new('a');
+        let mut menu = Menu::new(MenuKey::F8);
         let (row, _) = choice_row(&menu, &m);
         let area = menu.area(&m).unwrap();
         let (command, start, _) = options(&menu, &m)[2];
@@ -1300,12 +1206,9 @@ mod tests {
         assert_eq!(bar.width, cells("Integer") + 2);
         assert!(bar.width < area.width, "the bar spans the whole row");
         assert_eq!(command, Command::Mode(ScaleMode::Integer));
-        // And the image is placed on exactly those cells.
-        let cup = positions(&text.as_bytes()[..placement(&text)])
-            .pop()
-            .unwrap();
-        assert_eq!(cup, (bar.y + 1, bar.x + 1));
-        assert!(text.contains(&format!(",c={},r=1;", bar.width)));
+        let mut buf = Buffer::empty(Rect::new(0, 0, m.cols, m.rows));
+        menu.render(&mut buf, &m, state());
+        assert_menu_background(&buf, area, Some(bar), state().theme);
 
         // The option is underlined as well as barred. Nothing else in the box
         // underlines anything, so this is the one cue that survives a terminal with
@@ -1320,7 +1223,7 @@ mod tests {
     #[test]
     fn only_commands_can_be_hovered() {
         let m = metrics(100, 40);
-        let mut menu = Menu::new('a');
+        let mut menu = Menu::new(MenuKey::F8);
         let col = m.cols / 2;
         menu.set_hover(menu.hit(&m, col, row_of(&menu, &m, "Quit")));
         assert!(menu.hover.is_some());

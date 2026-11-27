@@ -639,7 +639,13 @@ where
         tracing::warn!("dropping a {len}-byte remote clipboard");
         return Ok(ServerMsg::ExtendedClipboard(clipboard::Message::Ignored));
     }
-    Ok(ServerMsg::ExtendedClipboard(clipboard::decode(&body)?))
+    // The entire message has been consumed. A bad clipboard can be skipped
+    // here while reads from the connection itself still propagate their errors.
+    let message = clipboard::decode(&body).unwrap_or_else(|err| {
+        tracing::warn!("dropping malformed remote clipboard: {err}");
+        clipboard::Message::Ignored
+    });
+    Ok(ServerMsg::ExtendedClipboard(message))
 }
 
 #[cfg(test)]
@@ -756,6 +762,26 @@ mod server_msg_tests {
         }
         // And the length is what found the next message, so the stream is still aligned.
         assert_eq!(rest, NEXT_MESSAGE.to_vec());
+    }
+
+    #[tokio::test]
+    async fn a_damaged_clipboard_does_not_interrupt_the_following_message() {
+        let mut body = clipboard::provide("clipboard text");
+        body.pop(); // An incomplete checksum on a finished zlib stream.
+        let mut bytes = vec![3, 0, 0, 0];
+        bytes.extend_from_slice(&(-(body.len() as i32)).to_be_bytes());
+        bytes.extend_from_slice(&body);
+        bytes.extend_from_slice(&NEXT_MESSAGE);
+
+        let mut stream = bytes.as_slice();
+        assert!(matches!(
+            ServerMsg::read(&mut stream).await,
+            Ok(ServerMsg::ExtendedClipboard(clipboard::Message::Ignored))
+        ));
+        assert!(matches!(
+            ServerMsg::read(&mut stream).await,
+            Ok(ServerMsg::Bell)
+        ));
     }
 
     #[tokio::test]

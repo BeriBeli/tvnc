@@ -1,4 +1,4 @@
-# desktui
+# tvnc
 
 A VNC client that draws the remote desktop in your terminal as real pixels, using
 the Kitty graphics protocol — one remote pixel per terminal pixel, not a mosaic of
@@ -8,17 +8,16 @@ half-blocks.
 <img width="1374" height="1002" alt="Screenshot 2026-07-26 at 05 45 27" src="https://github.com/user-attachments/assets/f2259bcd-5d61-4451-8bc4-35dd98ceab70" />
 
 > [!NOTE]
-> This was made over a weekend using Claude Code and Opus 5 with xhigh, to test
-> frontier model capabilities.
+> Originally forked from [mishushakov/desktui](https://github.com/mishushakov/desktui).
 
 ## Features
 
-**Any VNC server, addressed the way you already do it.** `desktui host`,
-`desktui desk:1`, `desktui 10.0.0.5::5900`. Display numbers, raw ports and IPv6 parse
+**Any VNC server, addressed the way you already do it.** `tvnc host`,
+`tvnc desk:1`, `tvnc 10.0.0.5::5900`. Display numbers, raw ports and IPv6 parse
 the way every other VNC client parses them.
 
 **The desktop fits your window, four ways.** `--scale native | fit | integer | 1:1`,
-switchable live with `Ctrl+A` then `n s i 1`. Native asks the server to resize itself
+switchable in the `F8` menu by clicking a mode or pressing `m` to cycle. Native asks the server to resize itself
 to the terminal so nothing is resampled; the other three cover servers that refuse.
 Arrows pan when the view is cropped.
 
@@ -29,7 +28,7 @@ survive; older servers fall back to the Latin-1 messages RFB started with, which
 carry them. On by default, and `--no-clipboard` leaves your clipboard alone in both
 directions.
 
-**Look without touching.** `--view-only` for the session, `Ctrl+A v` to toggle. It
+**Look without touching.** `--view-only` for the session, or `v` in the menu to toggle. It
 stops input reaching the remote and leaves the pointer for the server to draw.
 
 **Tuned for the link you are on.** `--quality` and `--compression` trade sharpness and
@@ -39,24 +38,17 @@ that changes wholesale, like a page being scrolled, is where lossless gets expen
 and it is the server paying. `--no-push` goes further and takes the pace back from the
 server; see below.
 
-**Your keys reach the remote, not the terminal.** Everything is passed through,
-including `Ctrl+C`. Local commands live behind `Ctrl+A`, which `--prefix` moves when it
-collides with tmux.
+**Remote shortcuts.** With the desktop focused, `Ctrl+A` and `Ctrl+C` go to the
+server. Press `F8` or click **commands** on the status line for local controls.
 
 ## Installing
 
-Needs Rust 1.88 or newer. Edition 2024 alone would only ask for 1.85, but the
-terminal probe uses let-chains, which became stable in 1.88.
+Download a prebuilt binary from [GitHub Releases](https://github.com/BeriBeli/tvnc/releases),
+or build from source with Rust 1.88 or newer (edition 2024 alone would only ask for 1.85,
+but the terminal probe uses let-chains, which became stable in 1.88):
 
 ```
-cargo install desktui --locked
-```
-
-That installs the [released version](https://crates.io/crates/desktui). To get
-unreleased changes, build from the repository instead:
-
-```
-cargo install --git https://github.com/mishushakov/desktui --locked
+cargo install --git https://github.com/BeriBeli/tvnc --locked
 ```
 
 Or from a checkout:
@@ -65,23 +57,23 @@ Or from a checkout:
 cargo install --path . --locked
 ```
 
-All three build with the release profile and put `desktui` in `~/.cargo/bin`, which
+Both build with the release profile and put `tvnc` in `~/.cargo/bin`, which
 needs to be on your `PATH`. `--locked` builds against the versions in `Cargo.lock`;
 drop it to let Cargo pick newer ones.
 
 To build without installing:
 
 ```
-cargo build --release      # ./target/release/desktui
+cargo build --release      # ./target/release/tvnc
 ```
 
-Run the desktui binary:
+Run the tvnc binary:
 
 ```
-desktui desk:1
-desktui 10.0.0.5::5900 --scale fit
-desktui --print-caps          # what does this terminal support?
-desktui --test-pattern        # check the pipeline without a server
+tvnc desk:1
+tvnc 10.0.0.5::5900 --scale fit
+tvnc --print-caps          # what does this terminal support?
+tvnc --test-pattern        # check the pipeline without a server
 ```
 
 No server handy? `make desktop` starts one in Docker and `make run` connects to it.
@@ -100,8 +92,8 @@ pan.
 
 ## Requirements
 
-A terminal that implements the Kitty graphics protocol. **Ghostty**, **kitty** and
-**WezTerm** all do. A terminal with no image protocol cannot work at all. The startup
+A terminal that implements the Kitty graphics protocol. **Ghostty**, **kitty**, **Rex**
+and **WezTerm** all do. A terminal with no image protocol cannot work at all. The startup
 probe checks, and refuses with an explanation rather than drawing nothing.
 
 Also used when the terminal offers it:
@@ -117,14 +109,28 @@ Run `--print-caps` to see what your terminal answered. It reports the pixel geom
 from both `TIOCGWINSZ` and `CSI 14 t`, and warns when they disagree — that
 disagreement is the HiDPI trap, and everything downstream depends on it.
 
+When the kernel reports only rows and columns, tvnc uses the cell size measured
+at startup to handle window resizes. If you change the font size or display scale
+in such a terminal, restart tvnc to measure the cells again.
+
 ## Keys
 
-Everything goes to the remote desktop, so local commands live behind a prefix,
-`Ctrl+A` by default (`--prefix`).
+Press `F8` or click **commands** at the right end of the status line to open the
+local menu. Press `Esc`, press `F8` again, or click the same button to return
+to the remote desktop. In a short pane, scroll inside the menu. In a one-row
+pane, the menu uses the status line. Press `q` or click **Quit** to exit.
 
-| `Ctrl+A` then | |
+On the desktop, only an unmodified `F8` is reserved. To send one remote `F8`,
+choose **Send F8 to remote** in the menu or press `F8` then `8`. With
+`--menu-key none`, all desktop keystrokes go to the server and the menu opens
+by mouse. If a terminal answers neither the primary device attributes (DA1)
+query nor the Kitty graphics query, use `--force --menu-key f8` to open the
+menu from the keyboard. In this mode the terminal pauses mouse reporting while
+the menu is visible and resumes it when the desktop returns.
+
+| In the open menu | Action |
 |---|---|
-| `p` | the command menu |
+| `Esc` | return to the remote desktop |
 | `q` | quit |
 | `f` | full screen refresh |
 | `r` | renegotiate the remote size |
@@ -132,7 +138,6 @@ Everything goes to the remote desktop, so local commands live behind a prefix,
 | arrows | pan, when the view is cropped |
 | `v` | toggle view-only |
 | `c` | toggle statistics: ours (fps, tiles, bytes per frame) and the server's (updates per second, delivery time, megapixels per update), plus RTT and dropped frames |
-| `Ctrl+A` | send a literal `Ctrl+A` |
 
 Clipboard works in both directions: paste into the terminal and it reaches the
 remote clipboard; the remote clipboard arrives locally through OSC 52. With the
@@ -142,9 +147,21 @@ something on the remote actually pastes.
 
 ## Authentication
 
-None and VNC password, which covers TigerVNC, x11vnc, TightVNC, QEMU and Kasm. The
-password comes from `--password-file`, `$VNC_PASSWORD`, or a prompt — and the prompt
-only appears if the server actually asks.
+tvnc supports servers offering no authentication or classic VNC password
+authentication (`VncAuth`), including TigerVNC, x11vnc, TightVNC, QEMU and Kasm.
+To connect with a file created by TigerVNC's `vncpasswd`, pass its local path.
+
+```sh
+tvnc --passwd ~/.config/tigervnc/passwd localhost:1
+```
+
+The TigerVNC spelling `-passwd` also works. If the file contains two passwords,
+`--view-only` selects the second one. When that entry authenticates the connection,
+reconnect without `--view-only` to enable input with the full-control entry.
+A single password works in either mode.
+
+Without `--passwd`, tvnc uses `$VNC_PASSWORD` if set. Otherwise it prompts
+when the server requests a password.
 
 **Not supported:** macOS Screen Sharing (Apple Remote Desktop auth), RealVNC's
 proprietary scheme, and VeNCrypt/TLS-only servers. These fail with a clear message
@@ -179,18 +196,14 @@ framebuffer update are one picture, and half of them on screen is half a scroll 
 the wait is capped at 250ms per update, because a screen that stands still is worse than one
 with a seam.
 
-Tiles are placed with `z=-1`, below text and above the cell background, so the
-status line and command menu stay readable on top of the remote screen.
+Desktop tiles are placed below explicit cell backgrounds. Menus and notifications
+fill their cells with the theme colour, so desktop updates stay behind the entire
+panel, including its padding. Cells with the default background show the desktop.
 
-The mouse pointer is drawn here rather than by the server: asking for the `Cursor`
-pseudo-encoding gets the shape sent once and stops the server compositing it into the
-framebuffer, so the pointer keeps up with your hand instead of lagging it by a round
-trip. It is an image of its own with an id above every tile's, placed with sub-cell offsets and
-moved with a placement rather than a transmission — so moving the mouse costs about forty
-bytes, where blending it into each tile it touched used to retransmit two to four of them
-per frame. Being above every tile also means it stays visible over the command menu, which
-is what you click its items with. A view-only session does not ask, because there is no local
-pointer worth drawing and the server's own is the only way to see where the real one is.
+The server sends the mouse pointer shape with the `Cursor` pseudo-encoding. The viewer
+places this RGBA image above menu backgrounds and moves it with sub-cell offsets.
+A move costs about forty bytes and requires no tile retransmission. In view-only
+sessions the server draws its own pointer.
 
 Update requests are paced against the end of each framebuffer update, so there is
 never more than one in flight and the request goes out the moment the previous update
@@ -301,7 +314,7 @@ Reaching a real server over a network is a job for an SSH tunnel, not an open po
 
 ```
 ssh -f -N -L 5901:localhost:5901 user@host
-VNC_PASSWORD=… desktui localhost::5901
+VNC_PASSWORD=… tvnc localhost::5901
 ```
 
 `--log-file` is the only way to get diagnostics; anything written to stdout would

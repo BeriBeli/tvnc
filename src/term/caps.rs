@@ -1,8 +1,7 @@
 //! Terminal capability probing.
 //!
 //! Everything here talks to the terminal by hand, at the raw fd level, and must
-//! run *before* the crossterm event stream starts: crossterm would parse the
-//! replies as input events and we would never see them.
+//! run before the session's event reader and frame writer start.
 
 use std::io::{self, Write};
 use std::time::{Duration, Instant};
@@ -27,6 +26,8 @@ const PROBE_SHM_ID: u32 = 0x766;
 pub struct Caps {
     /// Answered the Kitty graphics query with `OK`.
     pub kitty_graphics: bool,
+    /// Answered the direct graphics query, including with an error.
+    pub kitty_graphics_reply: bool,
     /// Mode 1016, SGR-pixel mouse reporting: pointer position in pixels.
     pub pixel_mouse: bool,
     /// Mode 2026, synchronised output: a frame commits without tearing.
@@ -101,9 +102,8 @@ pub fn probe() -> Result<Caps> {
     Ok(caps)
 }
 
-/// Ask only for the pixel geometry. Used when `TIOCGWINSZ` reports no pixel
-/// size, which is common under tmux.
-pub fn query_pixel_geometry() -> Result<(u32, u32)> {
+/// Retry once during startup if neither the kernel nor the initial probe supplied geometry.
+pub(super) fn query_pixel_geometry() -> Result<(u32, u32)> {
     let reply = round_trip(b"\x1b[14t\x1b[c")?;
     let caps = parse_caps(&reply);
     caps.text_area_px
@@ -168,7 +168,16 @@ enum Seq<'a> {
 }
 
 fn is_da1(seq: &Seq<'_>) -> bool {
-    matches!(seq, Seq::Csi { body, final_byte: b'c' } if body.starts_with(b"?"))
+    matches!(seq, Seq::Csi { body, final_byte: b'c' } if da1_parameters(body).is_some())
+}
+
+/// Both the startup sentinel and frame acknowledgements use a private DA1
+/// response with numeric parameters. An empty response cannot confirm either.
+pub(super) fn da1_parameters(body: &[u8]) -> Option<&[u8]> {
+    let params = body.strip_prefix(b"?")?;
+    (params.first().is_some_and(u8::is_ascii_digit)
+        && params.iter().all(|b| b.is_ascii_digit() || *b == b';'))
+    .then_some(params)
 }
 
 /// Split a reply stream into the sequences we care about, ignoring anything else
@@ -233,20 +242,19 @@ fn parse_caps(buf: &[u8]) -> Caps {
 
     for seq in sequences(buf) {
         match seq {
-            Seq::Apc(payload) => {
-                // `Gi=<id>;OK` -- the id says which question is being answered.
-                let ok = payload.starts_with(b"G")
-                    && payload.windows(3).any(|w| w == b"=OK" || w == b";OK");
-                if ok && contains_id(payload, PROBE_IMAGE_ID) {
-                    caps.kitty_graphics = true;
+            Seq::Apc(payload) => match graphics_reply(payload) {
+                Some((PROBE_IMAGE_ID, status)) => {
+                    caps.kitty_graphics_reply = true;
+                    caps.kitty_graphics |= status == b"OK";
                 }
-                if ok && contains_id(payload, PROBE_SHM_ID) {
-                    caps.shm_graphics = true;
-                }
-            }
+                Some((PROBE_SHM_ID, b"OK")) => caps.shm_graphics = true,
+                _ => {}
+            },
             Seq::Csi { body, final_byte } => match final_byte {
-                b'c' if body.starts_with(b"?") => {
-                    caps.da1 = Some(String::from_utf8_lossy(&body[1..]).into_owned());
+                b'c' => {
+                    if let Some(params) = da1_parameters(body) {
+                        caps.da1 = Some(String::from_utf8_lossy(params).into_owned());
+                    }
                 }
                 b't' => {
                     // `CSI 4 ; height ; width t` and `CSI 6 ; cell_h ; cell_w t`.
@@ -299,11 +307,18 @@ fn params(body: &[u8]) -> Vec<u32> {
         .collect()
 }
 
-fn contains_id(payload: &[u8], id: u32) -> bool {
-    let needle = format!("i={id}");
-    payload
-        .windows(needle.len())
-        .any(|w| w == needle.as_bytes())
+/// Image id and status in a Kitty graphics reply, without its APC delimiters.
+pub(super) fn graphics_reply(payload: &[u8]) -> Option<(u32, &[u8])> {
+    let mut parts = payload.strip_prefix(b"G")?.splitn(2, |&b| b == b';');
+    let id = parts
+        .next()?
+        .split(|&b| b == b',')
+        .find_map(|field| field.strip_prefix(b"i="))?;
+    let status = parts.next()?;
+    if status.is_empty() {
+        return None;
+    }
+    Some((std::str::from_utf8(id).ok()?.parse().ok()?, status))
 }
 
 /// Base64 of three zero bytes: a 1x1 black RGB pixel.
@@ -385,13 +400,16 @@ mod tests {
 
     #[test]
     fn an_error_reply_does_not_count_as_support() {
-        let caps = parse_caps(b"\x1b_Gi=1894;EBADF:no shm\x1b\\\x1b[?62;22c");
+        let caps = parse_caps(b"\x1b_Gi=1893;EINVAL\x1b\\\x1b_Gi=1894;EBADF:no shm\x1b\\");
+        assert!(caps.kitty_graphics_reply);
+        assert!(!caps.kitty_graphics);
         assert!(!caps.shm_graphics);
     }
 
     #[test]
     fn ignores_a_graphics_reply_for_someone_elses_image() {
-        let caps = parse_caps(b"\x1b_Gi=99;OK\x1b\\\x1b[?6c");
+        let caps = parse_caps(b"\x1b_Gi=18930;OK\x1b\\\x1b[?6c");
+        assert!(!caps.kitty_graphics_reply);
         assert!(!caps.kitty_graphics);
     }
 

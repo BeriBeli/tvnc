@@ -20,7 +20,7 @@
 //! `rfbproto.rst`), which is where this extension is specified.
 
 use crate::rfb::{MAX_CUT_TEXT, VncError};
-use std::io::{Read, Write};
+use std::io::{ErrorKind, Read, Write};
 
 /// Format and action bits of the flags word.
 pub mod flag {
@@ -206,10 +206,20 @@ fn decode_provide(flags: u32, body: &[u8]) -> Result<Message, VncError> {
     // cap that applies to it applies to the whole stream.
     let mut inflated = Vec::new();
     let limit = (MAX_CUT_TEXT as u64) + 4;
-    flate2::read::ZlibDecoder::new(body)
+    let result = flate2::read::ZlibDecoder::new(body)
         .take(limit)
-        .read_to_end(&mut inflated)
-        .map_err(|err| VncError::General(format!("extended clipboard was not zlib: {err}")))?;
+        .read_to_end(&mut inflated);
+    if let Err(err) = result {
+        // TigerVNC sends the bytes through Z_SYNC_FLUSH. The empty stored block
+        // ends the message, but a decoder expecting a final zlib block reports EOF.
+        let sync_flushed =
+            err.kind() == ErrorKind::UnexpectedEof && body.ends_with(&[0x00, 0x00, 0xff, 0xff]);
+        if !sync_flushed {
+            return Err(VncError::General(format!(
+                "invalid extended clipboard zlib data: {err}"
+            )));
+        }
+    }
     if inflated.len() as u64 > MAX_CUT_TEXT as u64 {
         return Err(VncError::General(format!(
             "extended clipboard inflated past the {MAX_CUT_TEXT}-byte cap"
@@ -452,7 +462,7 @@ mod tests {
     }
 
     #[test]
-    fn a_provide_longer_than_its_declared_size_is_refused() {
+    fn a_provide_must_contain_all_its_declared_text() {
         // The size is the client's only bound on the text inside the stream, so a
         // size past the end of the data cannot be trusted to be a rounding error.
         let mut plain = 64u32.to_be_bytes().to_vec();
@@ -464,9 +474,17 @@ mod tests {
             encoder.write_all(&plain).unwrap();
             encoder.finish().unwrap();
         }
-        let mut body = (flag::PROVIDE | flag::TEXT).to_be_bytes().to_vec();
-        body.extend_from_slice(&deflated);
-        assert!(decode(&body).is_err());
+        let sync_flushed = crate::rfb::codec::testing::deflate(&plain);
+        for compressed in [deflated, sync_flushed] {
+            let mut body = (flag::PROVIDE | flag::TEXT).to_be_bytes().to_vec();
+            body.extend_from_slice(&compressed);
+            let err = decode(&body).unwrap_err();
+            assert!(
+                err.to_string()
+                    .contains("declared 64 bytes of text and sent 4"),
+                "{err}"
+            );
+        }
     }
 
     #[test]

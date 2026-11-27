@@ -29,27 +29,6 @@ pub const EXPECTED_SIZE: &str = "1600x832";
 /// The escape that carries one tile to the terminal. Counting these counts drawing.
 pub const DREW: &[u8] = b"\x1b_Ga=T";
 
-/// The image ids the client's overlays take: `kitty::IMAGE_ID_BASE + 0x40000` for the
-/// menu's backdrop, and one each above it for the bar under the pointer and the
-/// notification popup. Worked out here the way the client works them out, because a
-/// test reads the numbers off the wire rather than the constants behind them -- which
-/// means this has to move when the client's base does, as it did when tiles started
-/// taking ids by position and needed the room below the overlays.
-pub const MENU_ID: u32 = 0x7600 + 0x40000;
-pub const MENU_HIGHLIGHT_ID: u32 = MENU_ID + 1;
-pub const TOAST_ID: u32 = MENU_HIGHLIGHT_ID + 1;
-
-/// The escape that takes one of those off the screen.
-///
-/// The id is the point, and `a=d,d=I` on its own will not do: a delete by id also goes
-/// out on every frame where the pointer is on no row of the menu, to drop the highlight
-/// bar, so the bare form is satisfied by the menu being *up* rather than by its having
-/// gone. Deleting is also the only way an overlay leaves: its glyphs outlive any repaint
-/// of the image below them, and its backdrop outranks every tile.
-pub fn deleted(id: u32) -> Vec<u8> {
-    format!("\x1b_Ga=d,d=I,i={id}").into_bytes()
-}
-
 /// A fake server of the given size, and a client pointed at it in native mapping.
 pub fn start(resize: Resize, remote: (u16, u16)) -> (FakeServer, FakeTerm) {
     let server = FakeServer::start(remote.0, remote.1, resize);
@@ -72,7 +51,7 @@ pub fn start_with(ext: Extensions, remote: (u16, u16), extra: &[&str]) -> (FakeS
 
 /// As [`start_with`], with environment for the client.
 ///
-/// `DESKTUI_MAX_PARTIAL_WAIT_MS` is the one worth knowing about: it is how long a frame
+/// `TVNC_MAX_PARTIAL_WAIT_MS` is the one worth knowing about: it is how long a frame
 /// will wait for the update it would be drawing to finish arriving before drawing the seam
 /// instead, which is a deadline no test can prove the right side of. A machine loaded
 /// enough -- the whole suite in parallel, several servers and ptys at once -- crosses any
@@ -95,10 +74,11 @@ pub fn start_with_env(
     (server, term)
 }
 
-/// Quit through the prefix: Ctrl+A then q.
+pub const F8: &[u8] = b"\x1b[19~";
+
+/// Open the command menu from the desktop and quit.
 pub fn quit(term: &mut FakeTerm) {
-    term.send(&[0x01]);
-    std::thread::sleep(Duration::from_millis(50));
+    term.send(F8);
     term.send(b"q");
 }
 
@@ -160,16 +140,27 @@ pub fn assert_reports_size(term: &FakeTerm, size: &str, timeout: Duration) {
     );
 }
 
-/// Wait for `text` to be on screen, wherever it is.
-pub fn wait_for_text(term: &FakeTerm, text: &str, timeout: Duration) -> bool {
-    let start = std::time::Instant::now();
-    while start.elapsed() < timeout {
-        if Screen::of(&term.output()).contains(text) {
-            return true;
+/// Wait for a screen state and return the output offset where it was observed.
+pub fn wait_for_screen(
+    term: &FakeTerm,
+    timeout: Duration,
+    matches: impl Fn(&Screen) -> bool,
+) -> Option<usize> {
+    let start = Instant::now();
+    loop {
+        let out = term.output();
+        if matches(&Screen::of(&out)) {
+            return Some(out.len());
+        }
+        if start.elapsed() >= timeout {
+            return None;
         }
         std::thread::sleep(Duration::from_millis(20));
     }
-    Screen::of(&term.output()).contains(text)
+}
+
+pub fn wait_for_text(term: &FakeTerm, text: &str, timeout: Duration) -> bool {
+    wait_for_screen(term, timeout, |screen| screen.contains(text)).is_some()
 }
 
 /// Every remote pixel lands on exactly one terminal pixel.

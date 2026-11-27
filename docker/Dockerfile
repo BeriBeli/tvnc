@@ -1,4 +1,4 @@
-# A desktop and a VNC server, for testing desktui against something real.
+# A desktop and a VNC server, for testing tvnc against something real.
 #
 # TigerVNC on purpose: its -AcceptSetDesktopSize defaults to on, so a client asking
 # for its own size is actually honoured. That is the path worth testing, and the one
@@ -96,7 +96,7 @@ RUN chmod 755 /usr/local/bin/entrypoint.sh
 # key VNC authentication uses. Override with -e VNC_PASSWORD=... if you like, but do
 # not mistake it for protection -- the session that follows is in the clear, which is
 # why the compose file and the Makefile publish this to 127.0.0.1 only.
-ENV VNC_PASSWORD=desktui \
+ENV VNC_PASSWORD=tvnc \
     VNC_GEOMETRY=1280x800 \
     VNC_DISPLAY=:1 \
     VNC_PORT=5901

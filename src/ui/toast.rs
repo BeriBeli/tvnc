@@ -5,16 +5,8 @@
 //! were the first thing a narrow terminal cut off. They land in the top-right corner
 //! instead, held off it by a margin, and take themselves off again after [`LINGER`].
 //!
-//! Everything the popup needs the menu needed first, and for the same reasons: a
-//! backdrop that is an image, because a cell colour under the remote screen is never
-//! seen (see `menu`), and an explicit blanking of its cells when it goes, because the
-//! message is text and no repaint of the tiles below it can erase that.
-//!
-//! It can also be dismissed before its time, by the `x` at the right of the message: the
-//! same button the menu's title carries, and a click acts on exactly the cell it is drawn
-//! on, with no slack around it. Under the pointer it lifts exactly as the menu's does, the
-//! palette defining that for both of them (see `theme`): by colour, which is also the one
-//! kind of highlight that needs no image of its own out here.
+//! It draws over the menu in the shared cell buffer. The close button uses the
+//! same styling and hit area as the one in the menu title.
 //!
 //! The rest of the box is not a target, so the pointer goes on reaching the remote screen
 //! underneath as it crosses a note it has already read. The session offers the pointer
@@ -22,17 +14,17 @@
 
 use std::time::{Duration, Instant};
 
+use ratatui::buffer::Buffer;
 use ratatui::layout::{Position, Rect};
 use ratatui::style::Style;
 use ratatui::text::{Line, Span};
-use ratatui::widgets::{Block, Padding, Widget};
+use ratatui::widgets::{Block, Clear, Padding, Widget};
 
-use super::chrome::Chrome;
 use super::theme::{Palette, colour};
 // The button is the menu's, not one of the popup's own: the way to close a thing should
 // look the same wherever it is.
 use super::CLOSE;
-use crate::term::{Metrics, kitty};
+use crate::term::Metrics;
 
 /// How long a note stays on screen.
 pub const LINGER: Duration = Duration::from_secs(4);
@@ -189,7 +181,7 @@ impl Toast {
     }
 
     /// Draw the note, if there is one, over the top-right of the remote screen.
-    pub fn render(&self, chrome: &mut Chrome, out: &mut Vec<u8>, metrics: &Metrics, ink: &Palette) {
+    pub fn render(&self, buf: &mut Buffer, metrics: &Metrics, ink: &Palette) {
         let Some((text, _)) = &self.showing else {
             return;
         };
@@ -197,20 +189,8 @@ impl Toast {
             return;
         };
 
-        // The backdrop first and the message on it. Above the menu's two ids, so a
-        // note that lands while the menu is open is composited over it rather than
-        // buried under it.
-        kitty::place_solid(
-            out,
-            kitty::TOAST_IMAGE_ID,
-            usize::from(area.x) + 1,
-            usize::from(area.y) + 1,
-            usize::from(area.width),
-            usize::from(area.height),
-            ink.paper,
-        );
-        chrome.keep(kitty::TOAST_IMAGE_ID);
-        let buf = chrome.buffer();
+        // Padding and spaces in a notification also cover any menu text beneath it.
+        Clear.render(area, buf);
         let block = Block::new()
             .padding(Padding::symmetric(PAD_X, PAD_Y))
             .style(Style::new().bg(colour(ink.paper)).fg(colour(ink.ink)));
@@ -228,11 +208,6 @@ impl Toast {
             Style::new().fg(colour(ink.ink)),
         ))
         .render(said, buf);
-        // The palette's own styling for the button, quiet or lit, which is the styling the
-        // menu's title gives the same button: one definition, so pointing at either does
-        // the same thing. Colour and nothing else, which is also the one kind of highlight
-        // that needs no image of its own -- a background here would be painted under the
-        // remote screen and never seen.
         Line::from(Span::styled(CLOSE, ink.close_button(self.hover))).render(close_at(area), buf);
     }
 
@@ -251,17 +226,12 @@ impl Toast {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::ui::chrome::Chrome;
     use crate::ui::theme::probe::{bg, fg};
     use crate::ui::theme::{Rgb, Theme};
 
     fn ink() -> &'static Palette {
         Theme::Dark.palette()
-    }
-
-    /// Was the image itself dropped? `d=I` frees the image; the lower-case `d=i` before
-    /// every placement only releases the placement on it.
-    fn dropped(text: &str, id: u32) -> bool {
-        text.contains(&format!("a=d,d=I,i={id},"))
     }
 
     /// What was written in `colour`: everything from where it was set up to the reset
@@ -291,7 +261,7 @@ mod tests {
     fn draw_toast(toast: &Toast, chrome: &mut Chrome, m: &Metrics, ink: &Palette) -> Vec<u8> {
         chrome.begin(m);
         let mut out = Vec::new();
-        toast.render(chrome, &mut out, m, ink);
+        toast.render(chrome.buffer(), m, ink);
         chrome.flush(&mut out);
         chrome.commit();
         out
@@ -391,33 +361,32 @@ mod tests {
     }
 
     #[test]
-    fn the_popup_carries_its_own_backdrop() {
-        // Tiles sit at z=-1: below the text but above the cell background, so no SGR
-        // fill is ever seen behind the glyphs. The backdrop has to be an image of our
-        // own, outranking every tile id -- and the menu's, so a note that arrives with
-        // the menu open is not drawn underneath it.
-        let (_, out) = shown(&metrics(80, 24), "remote clipboard copied");
-        let text = String::from_utf8(out).unwrap();
-        assert!(
-            text.contains(&format!("i={},", kitty::TOAST_IMAGE_ID)),
-            "the popup must place a backdrop image, not colour its cells"
-        );
-        const { assert!(kitty::TOAST_IMAGE_ID > kitty::MENU_HIGHLIGHT_IMAGE_ID) };
-        assert!(
-            text.contains("z=-1"),
-            "the backdrop shares the tiles' z-index; above it would cover the message"
-        );
-        assert!(
-            text.contains(&bg(ink().paper)) && text.contains(&fg(ink().ink)),
-            "the cells are coloured too, for a terminal with no graphics protocol"
-        );
-        assert!(
-            !text.contains("\x1b[7m"),
-            "reverse video would follow the theme instead of the palette"
-        );
-        // The backdrop goes down before the message that sits on it.
-        let backdrop = text.find("\x1b_Ga=T").expect("no backdrop");
-        assert!(backdrop < text.find("clipboard").expect("no message"));
+    fn the_entire_popup_covers_underlying_menu_text_and_styles() {
+        use ratatui::style::{Color, Modifier};
+
+        let m = metrics(80, 24);
+        let msg = "remote clipboard copied";
+        let rect = area(&m, msg).unwrap();
+        let mut buf = Buffer::empty(Rect::new(0, 0, m.cols, m.rows));
+        for cell in &mut buf.content {
+            cell.set_symbol("#")
+                .set_bg(Color::Red)
+                .set_style(Style::new().add_modifier(Modifier::UNDERLINED));
+        }
+        let mut toast = Toast::default();
+        toast.show(msg.into());
+        toast.render(&mut buf, &m, ink());
+        for pos in buf.area.positions() {
+            let cell = &buf[pos];
+            if rect.contains(pos) {
+                assert_eq!(cell.bg, colour(ink().paper), "{pos:?}");
+                assert_ne!(cell.symbol(), "#", "{pos:?}");
+                assert!(!cell.modifier.contains(Modifier::UNDERLINED), "{pos:?}");
+            } else {
+                assert_eq!(cell.bg, Color::Red, "{pos:?}");
+                assert_eq!(cell.symbol(), "#", "{pos:?}");
+            }
+        }
     }
 
     #[test]
@@ -534,18 +503,10 @@ mod tests {
             "and the quiet ink was the button's alone: {lit:?}"
         );
 
-        // Nothing else changes. A ground behind it would have to be an image out here,
-        // being invisible as a cell colour, and a rule under it would be a second mark
-        // for one thing; the row is the same shape lit or not.
+        // Hover changes the button's foreground colour.
         assert!(
             !lit.contains(&bg(ink.hover)) && !lit.contains("\x1b[4m"),
             "the colour is the whole of the lift: {lit:?}"
-        );
-        let images = |text: &str| text.matches("\x1b_G").count();
-        assert_eq!(
-            images(&lit),
-            images(&quiet),
-            "the lit button placed an image of its own: {lit:?}"
         );
         assert_eq!(
             rows(lit.as_bytes()),
@@ -568,8 +529,10 @@ mod tests {
                 .iter()
                 .all(|(.., t)| t.trim().is_empty())
         );
-        // The backdrop outranks every tile and would stay on top of them for ever.
-        assert!(dropped(&text, kitty::TOAST_IMAGE_ID));
+        assert!(
+            !text.contains(&bg(ink().paper)),
+            "dismissal restored the popup background"
+        );
 
         // The next note is not lit before the pointer has said so.
         toast.show("full refresh requested".into());
@@ -600,8 +563,7 @@ mod tests {
         toast.age(LINGER);
         assert!(toast.expire(), "the note outstayed its linger");
 
-        // Blanked cells and a dropped backdrop: the message is text, which no repaint
-        // of the tiles under it would erase.
+        // The message and its padding must reveal the desktop again.
         let text = String::from_utf8(draw_toast(&toast, &mut chrome, &m, ink())).unwrap();
         assert_eq!(
             rows(text.as_bytes()).len(),
@@ -613,10 +575,7 @@ mod tests {
                 .iter()
                 .all(|(.., t)| t.trim().is_empty())
         );
-        assert!(
-            text.contains(&format!("i={}", kitty::TOAST_IMAGE_ID)),
-            "the backdrop outranks every tile and would stay on top of them: {text:?}"
-        );
+        assert!(!text.contains(&bg(ink().paper)));
         assert!(!text.contains("renegotiating"), "redrew what it took off");
 
         // And nothing more to say on the frame after that.

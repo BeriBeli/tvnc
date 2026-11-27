@@ -15,6 +15,8 @@ use std::sync::mpsc::{
 use std::thread::JoinHandle;
 use std::time::Duration;
 
+use super::{DISABLE_MOUSE_MOTION, ENABLE_MOUSE_MOTION};
+
 /// Number of buffers kept in rotation. Two is enough: one being filled, one
 /// being written.
 const POOL: usize = 2;
@@ -23,6 +25,9 @@ const POOL: usize = 2;
 const DRAIN_GRACE: Duration = Duration::from_millis(250);
 
 pub struct FrameWriter {
+    mouse_motion: Option<bool>,
+    clipboard: Option<Vec<u8>>,
+    bell: bool,
     frames: Option<SyncSender<Vec<u8>>>,
     returned: Receiver<Vec<u8>>,
     recycled: SyncSender<Vec<u8>>,
@@ -38,7 +43,7 @@ impl FrameWriter {
         let (done_tx, done_rx) = channel::<()>();
 
         let thread = std::thread::Builder::new()
-            .name("desktui-writer".into())
+            .name("tvnc-writer".into())
             .spawn(move || {
                 let stdout = io::stdout();
                 let mut out = stdout.lock();
@@ -56,6 +61,9 @@ impl FrameWriter {
             .expect("failed to spawn the terminal writer thread");
 
         Self {
+            mouse_motion: None,
+            clipboard: None,
+            bell: false,
             frames: Some(frame_tx),
             returned: back_rx,
             recycled: back_tx_for_caller,
@@ -93,13 +101,61 @@ impl FrameWriter {
         }
     }
 
-    /// Hand over a frame that must not be dropped, such as one carrying a mode
-    /// change. Blocks until the writer takes it.
-    pub fn submit_blocking(&self, buf: Vec<u8>) -> Result<(), Busy> {
-        let Some(tx) = &self.frames else {
-            return Err(Busy::Closed);
-        };
-        tx.send(buf).map_err(|_| Busy::Closed)
+    pub fn ring_bell(&mut self) {
+        self.bell = true;
+    }
+
+    pub fn set_clipboard(&mut self, text: &str) {
+        use base64::Engine as _;
+        let mut buf = self.clipboard.take().unwrap_or_else(|| self.take_buffer());
+        buf.clear();
+        buf.extend_from_slice(b"\x1b]52;c;");
+        buf.extend_from_slice(
+            base64::engine::general_purpose::STANDARD
+                .encode(text.as_bytes())
+                .as_bytes(),
+        );
+        buf.push(0x07);
+        self.clipboard = Some(buf);
+    }
+
+    /// All later frames follow this mode change in the terminal output stream.
+    pub fn mouse_reporting_disabled(&self) -> bool {
+        self.mouse_motion == Some(false)
+    }
+
+    /// A full terminal queue must never stall remote key-up events. Keep the
+    /// latest clipboard, focus mode and bell pending until a slot is available.
+    pub fn flush_controls(&mut self, enabled: bool) -> io::Result<()> {
+        let change_mode = self.mouse_motion != Some(enabled);
+        if !change_mode && !self.bell && self.clipboard.is_none() {
+            return Ok(());
+        }
+        let mut buf = self.clipboard.take().unwrap_or_else(|| self.take_buffer());
+        let clipboard_len = buf.len();
+        if change_mode {
+            buf.extend_from_slice(if enabled {
+                ENABLE_MOUSE_MOTION
+            } else {
+                DISABLE_MOUSE_MOTION
+            });
+        }
+        if self.bell {
+            buf.push(0x07);
+        }
+        match self.submit(buf) {
+            Ok(()) => {
+                self.mouse_motion = Some(enabled);
+                self.bell = false;
+            }
+            Err(Busy::Full(mut buf)) if clipboard_len > 0 => {
+                buf.truncate(clipboard_len);
+                self.clipboard = Some(buf);
+            }
+            Err(Busy::Full(buf)) => self.recycle(buf),
+            Err(Busy::Closed) => return Err(io::ErrorKind::BrokenPipe.into()),
+        }
+        Ok(())
     }
 
     /// Flush everything queued and stop the thread.

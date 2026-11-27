@@ -4,16 +4,11 @@
 //! the eye is concerned: the bar names what you are connected to, the menu lists what
 //! you can do about it and the popup says what came of it, and a light box over a dark
 //! bar would read as two programs.
-//!
-//! Every colour is kept as bytes rather than as a `ratatui::Color`. The menu needs
-//! both forms -- its backdrop and its highlight are images, because a cell colour
-//! under the remote screen is never seen (see `menu`) -- and one definition that
-//! converts is a colour that cannot drift from itself.
 
 use ratatui::style::{Color, Style};
 use ratatui::text::Span;
 
-/// A colour as the graphics protocol wants it.
+/// Red, green and blue channel values.
 pub type Rgb = (u8, u8, u8);
 
 /// The same colour as the cell attributes want it.
@@ -52,9 +47,7 @@ pub struct Palette {
     pub bar: Rgb,
     pub text: Rgb,
     pub bright: Rgb,
-    /// Shared by both: the menu's headings and whatever the pointer is on, and the
-    /// bar's light for a prefix waiting on its key. Being the same in both places is
-    /// the whole of its job.
+    /// Menu headings and hovered controls.
     pub accent: Rgb,
 }
 
@@ -67,12 +60,6 @@ impl Palette {
     /// Status text worth reading at a glance.
     pub fn bright<'a>(&self, text: &'a str) -> Span<'a> {
         Span::styled(text, Style::new().fg(colour(self.bright)))
-    }
-
-    /// A mark in the menu's own colour. Used once: the light that comes on while the
-    /// prefix waits for the key that follows it.
-    pub fn accent<'a>(&self, text: &'a str) -> Span<'a> {
-        Span::styled(text, Style::new().fg(colour(self.accent)))
     }
 
     /// The button that closes a piece of chrome, quiet or under the pointer.

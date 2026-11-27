@@ -38,8 +38,9 @@ leaves the next read mid-message, where everything afterwards is garbage in a wa
 looks nothing like its cause.
 
 **Integration suites, in `tests/`** — every one runs the real binary inside a pty that
-the test drives, answering capability queries the way Ghostty does and then inspecting
-the escape stream it produces. They differ in what else is real.
+the test drives. It answers startup queries and acknowledges each changed set of click
+targets after reading its frame. The menu tests can pause that reader while the client
+continues receiving input. The suites differ in what else is real.
 
 | suite | what it covers |
 |---|---|
@@ -72,7 +73,7 @@ genuinely exercised rather than quietly falling back. Point the client at an `x1
 instance instead to exercise the other path — it usually answers "administratively
 prohibited", which is what the status line has to explain.
 
-Override the target with `DESKTUI_TEST_SERVER` and `DESKTUI_TEST_PASSWORD`.
+Override the target with `TVNC_TEST_SERVER` and `TVNC_TEST_PASSWORD`.
 
 ## Fake and live counterparts
 
@@ -132,7 +133,7 @@ rather than let the screen stand still. No test can prove the right side of that
 outside: what reaches the terminal says which rectangles a frame carried, never how long the
 client had waited for them, and a machine loaded enough -- the whole suite in parallel,
 several servers and ptys at once -- crosses any wall-clock deadline eventually. So
-`DESKTUI_MAX_PARTIAL_WAIT_MS` puts it a minute out of reach for
+`TVNC_MAX_PARTIAL_WAIT_MS` puts it a minute out of reach for
 `a_frame_is_never_composed_from_half_an_update`, and every seam that test sees is then the
 client failing to wait, with nothing about the machine's speed in it. The env var is a test
 seam and says so where it is defined -- it is not a command-line option.
@@ -146,13 +147,11 @@ negotiation read one of those as a tear about one full-suite run in three, and t
 that failed said so itself: the assertion prints the offending frames, and the placement in
 it was at the letterboxed origin rather than the settled one.
 
-One input can be lost rather than late, and it is worth knowing which: a bracketed paste
-whose first `\x1b` lands alone in a read is delivered as the *Escape key*, that byte being
-both the key and the start of every sequence, so the library guesses — and with no more
-input in hand it guesses key. The rest arrives as ordinary characters and the paste is
-gone. `session::paste` says it again for that reason, which costs a run nothing when the
-first one landed. The ambiguity is the client's, not the harness's: worth remembering if a
-paste is ever reported lost in real use.
+A lone `\x1b` normally becomes an Escape key after 25 ms. While a terminal that
+answered the startup probe owes a frame reply, the reader keeps the prefix across PTY
+reads. A reply can then finish after that deadline. If the next byte rules out a reply,
+the reader delivers the user's Escape first. The input tests split both DA1 and Kitty
+replies after the first byte and check the exact keys received by the VNC server.
 
 Output *after* the client exits is the harness's business rather than each test's.
 `FakeTerm::wait` closes its own end of the pty slave and waits for the drain thread to

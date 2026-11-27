@@ -6,7 +6,7 @@ use clap::{Parser, ValueEnum};
 
 /// A pixel-perfect VNC client for terminals that speak the Kitty graphics protocol.
 #[derive(Debug, Parser)]
-#[command(name = "desktui", version, about, long_about = None)]
+#[command(name = "tvnc", version, about, long_about = None)]
 pub struct Args {
     /// VNC server to connect to, as `host`, `host:port` or `host::port`.
     ///
@@ -16,9 +16,10 @@ pub struct Args {
     #[arg(value_name = "HOST[:DISPLAY]", required_unless_present_any = ["print_caps", "test_pattern"])]
     pub server: Option<String>,
 
-    /// Read the VNC password from this file (first line, trailing newline stripped).
+    /// Read a binary file made by TigerVNC's vncpasswd (also accepts -passwd).
+    /// With --view-only, use the view-only password if the file contains one.
     #[arg(long, value_name = "PATH")]
-    pub password_file: Option<PathBuf>,
+    pub passwd: Option<PathBuf>,
 
     /// How remote pixels map onto terminal pixels.
     #[arg(long, value_enum, default_value_t = ScaleMode::Native)]
@@ -66,9 +67,9 @@ pub struct Args {
     #[arg(long)]
     pub no_push: bool,
 
-    /// Local command prefix key, as a single character interpreted as Ctrl+<char>.
-    #[arg(long, default_value = "a", value_name = "CHAR")]
-    pub prefix: char,
+    /// Key to open the local command menu. Use "none" to open it only by clicking.
+    #[arg(long, value_enum, ignore_case = true, default_value_t = MenuKey::F8)]
+    pub menu_key: MenuKey,
 
     /// Reconnect automatically, with backoff, when the session drops.
     #[arg(long)]
@@ -90,6 +91,12 @@ pub struct Args {
     /// anything written to stdout would corrupt the graphics stream.
     #[arg(long, value_name = "PATH")]
     pub log_file: Option<PathBuf>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq, ValueEnum)]
+pub enum MenuKey {
+    F8,
+    None,
 }
 
 /// How the remote framebuffer is mapped onto the terminal's pixel area.
@@ -191,6 +198,21 @@ pub enum Transfer {
 }
 
 impl Args {
+    pub fn from_env() -> Self {
+        // TigerVNC viewers spell this long option with a single dash.
+        let mut options = true;
+        Self::parse_from(std::env::args_os().map(|arg| {
+            if arg == "--" {
+                options = false;
+            }
+            if options && arg == "-passwd" {
+                "--passwd".into()
+            } else {
+                arg
+            }
+        }))
+    }
+
     /// Resolve the `host[:display]` argument into a socket address string.
     pub fn server_addr(&self) -> anyhow::Result<String> {
         let spec = self
@@ -198,11 +220,6 @@ impl Args {
             .as_deref()
             .ok_or_else(|| anyhow::anyhow!("no server given"))?;
         parse_server(spec)
-    }
-
-    /// The prefix key as a control byte, e.g. `a` -> 0x01.
-    pub fn prefix_char(&self) -> char {
-        self.prefix.to_ascii_lowercase()
     }
 }
 

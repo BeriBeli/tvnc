@@ -26,24 +26,18 @@
 //! shape is not specified, so [`Chrome::begin`] reports the change and the caller erases,
 //! after which the frame says all of its chrome again rather than the difference from a
 //! screen it is only assuming.
-//!
-//! Overlay *images* -- the menu's backdrop, its hover bar, a note's paper -- are placements
-//! rather than cells, so they cannot be diffed. They are declared each frame instead, and
-//! whatever was placed last frame and is not wanted this one is deleted.
 
 use ratatui::buffer::Buffer;
 use ratatui::layout::Rect;
 
 use super::paint::write_diff;
-use crate::term::{Metrics, kitty};
+use crate::term::Metrics;
+use ratatui::style::Color;
 
 /// The chrome's own plane: what is on screen, and what should be.
 pub struct Chrome {
     shown: Buffer,
     next: Buffer,
-    /// Overlay image ids placed last frame, and the ones wanted this frame.
-    placed: Vec<u32>,
-    wanted: Vec<u32>,
 }
 
 impl Chrome {
@@ -52,8 +46,6 @@ impl Chrome {
         Self {
             shown: Buffer::empty(empty),
             next: Buffer::empty(empty),
-            placed: Vec::new(),
-            wanted: Vec::new(),
         }
     }
 
@@ -77,11 +69,8 @@ impl Chrome {
         if self.shown.area != area {
             self.shown = Buffer::empty(area);
             self.next = Buffer::empty(area);
-            // Whatever the terminal did with our overlays, they are not where we think.
-            self.placed.clear();
         }
         self.next.reset();
-        self.wanted.clear();
         resized
     }
 
@@ -90,14 +79,7 @@ impl Chrome {
         &mut self.next
     }
 
-    /// Note that an overlay image belongs on screen this frame. The caller places it; this
-    /// is what stops it being deleted at the end of the frame.
-    pub fn keep(&mut self, id: u32) {
-        self.wanted.push(id);
-    }
-
-    /// Write what changed, drop the overlays that are no longer wanted, and say which cells
-    /// were vacated so the picture under them can be drawn back.
+    /// Write the changed cells and return the cells that reveal the desktop again.
     ///
     /// After a [`Chrome::begin`] that reported a resize, the caller has to have erased the
     /// screen first: this then writes the whole of the new chrome, having forgotten the old.
@@ -106,25 +88,16 @@ impl Chrome {
     /// reached the terminal, because a frame the writer was too busy for did not happen and
     /// the next one has to say all of it again.
     pub fn flush(&mut self, out: &mut Vec<u8>) -> Vec<Rect> {
-        for id in &self.placed {
-            if !self.wanted.contains(id) {
-                kitty::delete_image(out, *id);
-            }
-        }
-
         let updates = self.shown.diff(&self.next);
         write_diff(out, &updates);
 
-        // A cell that has gone blank is a cell something was drawn on and is not any more,
-        // which is exactly the damage the tiles underneath need.
+        // Clearing even a blank padding cell can evict the tile underneath it.
         updates
             .iter()
             .filter(|(x, y, cell)| {
-                cell.symbol() == " "
-                    && self
-                        .shown
-                        .cell((*x, *y))
-                        .is_some_and(|was| was.symbol() != " ")
+                let was = &self.shown[(*x, *y)];
+                let erased_text = cell.symbol() == " " && was.symbol() != " ";
+                cell.bg == Color::Reset && (was.bg != Color::Reset || erased_text)
             })
             .map(|(x, y, _)| Rect::new(*x, *y, 1, 1))
             .collect()
@@ -133,7 +106,6 @@ impl Chrome {
     /// The frame reached the terminal, so what it drew is what is on screen.
     pub fn commit(&mut self) {
         std::mem::swap(&mut self.shown, &mut self.next);
-        std::mem::swap(&mut self.placed, &mut self.wanted);
     }
 }
 
@@ -251,28 +223,6 @@ mod tests {
     }
 
     #[test]
-    fn a_resize_forgets_the_overlays_rather_than_deleting_them() {
-        // A placement whose cells were erased is not somewhere we can reason about, and the
-        // frame re-places everything it wants anyway. Emitting a delete for it would be
-        // guessing in the other direction.
-        let m = metrics(20, 5);
-        let mut chrome = Chrome::new();
-        chrome.begin(&m);
-        chrome.keep(kitty::OVERLAY_IMAGE_ID);
-        chrome.flush(&mut Vec::new());
-        chrome.commit();
-
-        chrome.begin(&metrics(30, 9));
-        let mut out = Vec::new();
-        chrome.flush(&mut out);
-        assert!(
-            !String::from_utf8_lossy(&out).contains("a=d"),
-            "nothing to delete across a resize: {:?}",
-            String::from_utf8_lossy(&out)
-        );
-    }
-
-    #[test]
     fn a_dropped_frame_is_said_again() {
         // No commit, so nothing reached the terminal and the next frame owes all of it.
         let m = metrics(20, 5);
@@ -294,27 +244,22 @@ mod tests {
     }
 
     #[test]
-    fn an_overlay_nobody_wants_this_frame_is_deleted() {
-        let m = metrics(20, 5);
+    fn clearing_blank_padding_damages_only_the_cells_that_reveal_the_desktop() {
         let mut chrome = Chrome::new();
+        let m = metrics(12, 6);
         chrome.begin(&m);
-        chrome.keep(kitty::OVERLAY_IMAGE_ID);
-        let mut out = Vec::new();
-        chrome.flush(&mut out);
+        chrome
+            .buffer()
+            .set_style(Rect::new(4, 2, 3, 1), Style::new().bg(Color::Black));
+        chrome.flush(&mut Vec::new());
         chrome.commit();
-        assert!(
-            !String::from_utf8_lossy(&out).contains("a=d"),
-            "a wanted overlay must not be deleted"
-        );
 
         chrome.begin(&m);
-        let mut out = Vec::new();
-        chrome.flush(&mut out);
-        chrome.commit();
-        let text = String::from_utf8(out).unwrap();
-        assert!(
-            text.contains(&format!("i={},", kitty::OVERLAY_IMAGE_ID)),
-            "the overlay should have been dropped: {text:?}"
-        );
+        chrome
+            .buffer()
+            .set_style(Rect::new(5, 2, 1, 1), Style::new().bg(Color::White));
+        chrome.buffer().set_string(6, 2, "x", Style::new());
+        let vacated = chrome.flush(&mut Vec::new());
+        assert_eq!(vacated, [Rect::new(4, 2, 1, 1), Rect::new(6, 2, 1, 1)]);
     }
 }

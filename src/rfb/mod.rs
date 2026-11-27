@@ -48,6 +48,7 @@ mod event;
 
 pub use client::clipboard::Caps as ClipboardCaps;
 pub use client::{VncClient, VncConnector};
+pub(crate) use client::{VncPassword, decode_tigervnc_passwd};
 pub use config::{PixelFormat, VncEncoding, VncVersion, hint};
 pub use error::VncError;
 pub use event::{VncEvent, X11Event, fence};

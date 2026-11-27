@@ -239,6 +239,9 @@ pub enum Input {
 /// [`Update::Pushing(true)`](Update::Pushing) before anything else. Otherwise the
 /// session waits out its watchdog before asking for one.
 pub trait Backend {
+    /// The session authenticated with a credential reserved for viewing.
+    fn is_read_only(&self) -> bool;
+
     /// Wait for the next thing to happen on the remote desktop.
     async fn recv(&self) -> Result<Update>;
 
@@ -270,7 +273,7 @@ pub trait Connect {
 
     /// Supply the password the remote asked for, for this attempt and every later
     /// one.
-    fn use_password(&mut self, password: String);
+    fn use_password(&mut self, password: Vec<u8>);
 }
 
 /// Why a connection attempt did not produce a session.

@@ -7,6 +7,8 @@
 
 use crossterm::event::{KeyCode, MediaKeyCode, ModifierKeyCode};
 
+pub const F8: u32 = sym::F1 + 7;
+
 /// Keysyms for keys that are not characters.
 mod sym {
     pub const BACKSPACE: u32 = 0xff08;
@@ -141,12 +143,10 @@ pub fn modifier_keysym(m: ModifierKeyCode) -> u32 {
     }
 }
 
-/// Keysyms for the modifiers a terminal reports as a bitmask rather than as keys.
-///
-/// Needed only when the terminal cannot report modifier keys in their own right,
-/// in which case they have to be inferred from each event's modifier set.
+/// Left and right keysyms represented by each bit in a terminal modifier mask.
 pub mod bitmask {
     use super::sym;
+    use crossterm::event::KeyModifiers;
 
     pub const SHIFT: u32 = sym::SHIFT_L;
     pub const CONTROL: u32 = sym::CONTROL_L;
@@ -154,6 +154,15 @@ pub mod bitmask {
     pub const SUPER: u32 = sym::SUPER_L;
     pub const HYPER: u32 = sym::HYPER_L;
     pub const META: u32 = sym::META_L;
+
+    pub const MODIFIERS: [(KeyModifiers, u32, u32); 6] = [
+        (KeyModifiers::SHIFT, SHIFT, sym::SHIFT_R),
+        (KeyModifiers::CONTROL, CONTROL, sym::CONTROL_R),
+        (KeyModifiers::ALT, ALT, sym::ALT_R),
+        (KeyModifiers::SUPER, SUPER, sym::SUPER_R),
+        (KeyModifiers::HYPER, HYPER, sym::HYPER_R),
+        (KeyModifiers::META, META, sym::META_R),
+    ];
 }
 
 #[cfg(test)]

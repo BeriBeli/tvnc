@@ -9,17 +9,15 @@
 //! unasked, and whether a round trip can be measured -- are announced by the backend
 //! rather than assumed.
 
+use std::collections::VecDeque;
 use std::time::{Duration, Instant};
 
 use anyhow::{Context, Result};
-use crossterm::event::{
-    Event, EventStream, KeyCode, KeyEventKind, MouseButton, MouseEvent, MouseEventKind,
-};
-use futures::StreamExt;
+use crossterm::event::{Event, KeyEventKind, MouseButton, MouseEvent, MouseEventKind};
 use tokio::time::{MissedTickBehavior, interval};
 
 use crate::app::{FpsMeter, describe, human_bytes};
-use crate::cli::{Args, ScaleMode};
+use crate::cli::{Args, MenuKey, ScaleMode};
 use crate::remote::{
     Backend, Connect, ConnectError, Input, Key, ResizeStatus, Screen, ScreenInfo, ScreenLayout,
     Update,
@@ -27,7 +25,8 @@ use crate::remote::{
 use crate::render::framebuffer::Framebuffer;
 use crate::render::{FrameStats, Layout, Rect, Renderer};
 use crate::term::caps::Caps;
-use crate::term::input::{Command, InputMapper, KeyOutcome, LockState};
+use crate::term::events::{FrameQuery, KeyAlternates, Report, TerminalEvents};
+use crate::term::input::{Command, InputFocus, InputMapper, LockState};
 use crate::term::writer::{Busy, FrameWriter};
 use crate::term::{Metrics, TerminalGuard, kitty};
 use crate::ui::chrome::Chrome;
@@ -71,7 +70,7 @@ const MAX_PARTIAL_WAIT: Duration = Duration::from_millis(250);
 /// table, because nothing on the wire distinguishes a seam the client was entitled to draw
 /// from the bug of drawing one it was not -- and a shared machine under load will cross any
 /// wall-clock deadline eventually. Read once, at the start of a session.
-const PARTIAL_WAIT_ENV: &str = "DESKTUI_MAX_PARTIAL_WAIT_MS";
+const PARTIAL_WAIT_ENV: &str = "TVNC_MAX_PARTIAL_WAIT_MS";
 
 fn max_partial_wait() -> Duration {
     std::env::var(PARTIAL_WAIT_ENV)
@@ -107,6 +106,8 @@ enum Resize {
     /// No layout rectangle has arrived yet, so we do not know whether the server
     /// can resize.
     Probing,
+    /// The server advertised its layout. A usable terminal area may arrive later.
+    Available,
     /// The server never sent a layout rectangle in reply to a non-incremental
     /// request, which per the spec means it does not support resizing.
     Unsupported,
@@ -132,8 +133,20 @@ pub async fn run<C: Connect>(
     args: &Args,
     caps: &Caps,
     guard: &TerminalGuard,
+    mut metrics: Metrics,
     remote: &mut C,
 ) -> Result<()> {
+    let supported_query = FrameQuery::for_caps(caps);
+    let query = match supported_query {
+        Some(query) => query,
+        None if args.menu_key == MenuKey::None => anyhow::bail!(
+            "--menu-key none requires a terminal that answers DA1 or Kitty graphics queries. \
+             Use --menu-key f8 to open the command menu from the keyboard."
+        ),
+        // With --force the probe can be inconclusive. F8 remains available
+        // and a later DA1 reply can still enable mouse targets.
+        None => FrameQuery::DeviceAttributes,
+    };
     // The first connection is made before the alternate screen, so that a
     // password prompt is somewhere the user can see it. Later attempts reuse the
     // password and need no prompt.
@@ -143,6 +156,11 @@ pub async fn run<C: Connect>(
     let addr = remote.address().to_string();
     let mut next = Some(backend);
     let mut backoff = RECONNECT_BACKOFF;
+    let mut focused = true;
+    // Replies may already be buffered when the remote reconnects. Keep the
+    // input stream and its outstanding layout queries together across sessions.
+    let mut terminal = TerminalEvents::new(query).context("failed to open terminal input")?;
+    let mut presentation = Presentation::new(query, supported_query.is_some());
 
     loop {
         let backend = match next.take() {
@@ -167,8 +185,19 @@ pub async fn run<C: Connect>(
             },
         };
 
-        let mut session = Session::new(args, caps, backend).await?;
-        let result = session.run().await;
+        // A password prompt or reconnect may have spanned a window resize.
+        let mut session = Session::new(
+            args,
+            caps,
+            backend,
+            metrics.refreshed()?,
+            focused,
+            &mut presentation,
+        )
+        .await;
+        let result = session.run(&mut terminal).await;
+        metrics = session.metrics;
+        focused = session.focused;
         // Let go of anything held on the remote before leaving, so a modifier does
         // not stay stuck in whatever had focus over there.
         session.release_input().await;
@@ -220,11 +249,96 @@ async fn connect<C: Connect>(remote: &mut C) -> Result<C::Backend> {
     }
 }
 
-struct Session<B: Backend> {
+/// Click targets from one terminal frame, in the grid that frame was drawn on.
+#[derive(Clone, Copy, PartialEq, Eq)]
+struct MouseTargets {
+    metrics: Metrics,
+    menu_open: bool,
+    menu: Option<menu::Viewport>,
+    footer: status::FooterActions,
+}
+
+/// One ordered terminal reply per change of click targets, including a menu
+/// closing. Ordinary desktop frames and control writes incur no round trip.
+struct Presentation {
+    query: FrameQuery,
+    has_replies: bool,
+    displayed: Option<MouseTargets>,
+    pending: VecDeque<MouseTargets>,
+    // Set on submission: even an unacknowledged menu may already be visible.
+    menu_may_be_visible: bool,
+    // Bound memory even if a terminal accepts output but stops answering.
+    skipped: usize,
+}
+
+impl Presentation {
+    const MAX_PENDING: usize = 64;
+
+    fn new(query: FrameQuery, has_replies: bool) -> Self {
+        Self {
+            query,
+            has_replies,
+            displayed: None,
+            pending: VecDeque::new(),
+            menu_may_be_visible: false,
+            skipped: 0,
+        }
+    }
+
+    fn changed(&self, targets: MouseTargets) -> bool {
+        self.pending.back().copied().or(self.displayed) != Some(targets)
+    }
+
+    fn targets_for(&self, metrics: Metrics) -> Option<MouseTargets> {
+        // A resize can return to the previous dimensions while an intervening
+        // frame is still in the PTY. It too must be acknowledged before clicks resume.
+        self.displayed.filter(|shown| {
+            shown.metrics == metrics
+                && self.skipped == 0
+                && self.pending.iter().all(|frame| frame.metrics == metrics)
+        })
+    }
+
+    fn menu_owns_pointer(&self) -> bool {
+        if self.has_replies {
+            return self.menu_may_be_visible;
+        }
+        // A keyboard-only menu is drawn with terminal mouse reporting off.
+        // Capture can resume in the output stream after the closing frame.
+        self.pending.back().is_some_and(|frame| frame.menu_open)
+    }
+
+    fn submitted(&mut self, targets: MouseTargets) {
+        self.menu_may_be_visible |= targets.menu_open;
+        if self.pending.len() == Self::MAX_PENDING {
+            self.pending.pop_front();
+            self.skipped += 1;
+        }
+        self.pending.push_back(targets);
+    }
+
+    fn acknowledge(&mut self) {
+        if self.pending.is_empty() {
+            return;
+        }
+        self.has_replies = true;
+        if self.skipped != 0 {
+            self.skipped -= 1;
+            self.displayed = None;
+        } else if let Some(targets) = self.pending.pop_front() {
+            self.menu_may_be_visible =
+                targets.menu_open || self.pending.iter().any(|frame| frame.menu_open);
+            self.displayed = Some(targets);
+        }
+    }
+}
+
+struct Session<'a, B: Backend> {
     backend: B,
     fb: Framebuffer,
     renderer: Renderer,
     writer: FrameWriter,
+    presentation: &'a mut Presentation,
     metrics: Metrics,
     caps: Caps,
     input: InputMapper,
@@ -281,6 +395,8 @@ struct Session<B: Backend> {
     /// The command menu, and where the pointer is on it.
     menu: Menu,
     show_menu: bool,
+    /// A menu change needs the next frame even on an idle desktop.
+    menu_dirty: bool,
     /// The wipe a relayout asks for, waiting for the frame that fills the screen
     /// back in. Written on its own it is a blank screen that lasts until the next
     /// frame composes, which is what a resize looked like; carried into that frame's
@@ -323,14 +439,24 @@ struct Session<B: Backend> {
     /// When a resize was last acted on, which is what [`RESIZE_INTERVAL`] is measured
     /// from: the first after a lull goes through at once, and a stream is thinned.
     metrics_applied_at: Option<Instant>,
+    /// Whether the terminal window currently holds focus. Mouse motion reporting is
+    /// disarmed and any in-flight mouse reports are ignored while unfocused.
+    focused: bool,
     quit: bool,
 }
 
-impl<B: Backend> Session<B> {
-    async fn new(args: &Args, caps: &Caps, backend: B) -> Result<Self> {
-        let metrics = Metrics::query()?;
+impl<'a, B: Backend> Session<'a, B> {
+    async fn new(
+        args: &Args,
+        caps: &Caps,
+        backend: B,
+        metrics: Metrics,
+        focused: bool,
+        presentation: &'a mut Presentation,
+    ) -> Self {
         let remote = backend.resolution().await;
         let server_name = backend.name().await;
+        let view_only = args.view_only || backend.is_read_only();
 
         let fb = Framebuffer::new(u32::from(remote.0), u32::from(remote.1));
         let layout = Layout::compute(
@@ -341,14 +467,15 @@ impl<B: Backend> Session<B> {
             (0, 0),
         );
 
-        Ok(Self {
+        Self {
             backend,
             fb,
             renderer: Renderer::new(layout, true, args.transfer.resolve(caps)),
             writer: FrameWriter::spawn(),
+            presentation,
             metrics,
             caps: caps.clone(),
-            input: InputMapper::new(args.prefix_char(), caps.kitty_keyboard, caps.pixel_mouse),
+            input: InputMapper::new(args.menu_key, caps.kitty_keyboard, caps.pixel_mouse),
             server_name,
             mode: args.scale,
             pan: (0, 0),
@@ -365,13 +492,14 @@ impl<B: Backend> Session<B> {
             pushed_frames: false,
             remote_caps_lock: None,
             remote_num_lock: None,
-            view_only: args.view_only,
+            view_only,
             no_clipboard: args.no_clipboard,
             clipboard_lossy: true,
             theme: Theme::Dark,
             chrome: Chrome::new(),
-            menu: Menu::new(args.prefix_char()),
+            menu: Menu::new(args.menu_key),
             show_menu: false,
+            menu_dirty: false,
             pending_cleanup: Vec::new(),
             show_stats: false,
             toast: Toast::default(),
@@ -389,18 +517,24 @@ impl<B: Backend> Session<B> {
             dropped: 0,
             pending_metrics: None,
             metrics_applied_at: None,
+            focused,
             quit: false,
-        })
+        }
     }
 
-    async fn run(&mut self) -> Result<()> {
-        let mut terminal = EventStream::new();
+    async fn run(&mut self, terminal: &mut TerminalEvents) -> Result<()> {
         let mut ticker = interval(self.frame_time);
         // Falling behind should drop frames, not queue them up to be raced
         // through later.
         ticker.set_missed_tick_behavior(MissedTickBehavior::Delay);
 
         while !self.quit {
+            let capture_mouse = self.focused
+                && (self.presentation.has_replies
+                    || (!self.show_menu && !self.presentation.menu_owns_pointer()));
+            self.writer.flush_controls(capture_mouse)?;
+            let awaiting_frame_reply =
+                self.presentation.has_replies && !self.presentation.pending.is_empty();
             tokio::select! {
                 update = self.backend.recv() => match update {
                     Ok(update) => self.on_update(update).await?,
@@ -408,9 +542,11 @@ impl<B: Backend> Session<B> {
                         anyhow::bail!("the session ended: {err}");
                     }
                 },
-                Some(event) = terminal.next() => {
-                    let event = event.context("failed to read terminal input")?;
-                    self.on_terminal(event).await?;
+                report = terminal.next(awaiting_frame_reply) => {
+                    match report.context("failed to read terminal input")? {
+                        Report::Input(event, alternates) => self.on_terminal(event, alternates).await?,
+                        Report::FramePresented => self.presentation.acknowledge(),
+                    }
                 }
                 _ = ticker.tick() => self.on_tick().await?,
             }
@@ -509,7 +645,8 @@ impl<B: Backend> Session<B> {
             }
             Update::Clipboard(text) => {
                 if !self.no_clipboard {
-                    self.copy_to_local_clipboard(&text);
+                    self.writer.set_clipboard(&text);
+                    self.set_note("remote clipboard copied".into());
                 }
             }
             Update::ClipboardLossy(lossy) => {
@@ -522,12 +659,7 @@ impl<B: Backend> Session<B> {
                 );
                 self.clipboard_lossy = lossy;
             }
-            Update::Bell => {
-                // A bell is the one thing worth passing straight through.
-                let mut buf = self.writer.take_buffer();
-                buf.push(0x07);
-                let _ = self.writer.submit_blocking(buf);
-            }
+            Update::Bell => self.writer.ring_bell(),
             Update::LockKeys { num, caps } => {
                 // Only useful as something to compare the local keyboard against, so
                 // scroll lock never crosses the seam: no terminal reports it.
@@ -650,20 +782,11 @@ impl<B: Backend> Session<B> {
         } else {
             // Someone else changed it, or this is the initial report.
             self.on_remote_size(layout.screen, None).await?;
-            if was_probing {
-                self.resize = Resize::Unsupported; // provisional, refined below
-            }
-        }
-
-        if was_probing {
-            // A layout rectangle at all means SetDesktopSize is available.
-            self.resize = match self.resize {
-                Resize::Native => Resize::Native,
-                _ => Resize::Unsupported,
-            };
-            if self.mode == ScaleMode::Native {
-                self.resize = Resize::Probing;
-                self.request_native_size(false).await?;
+            if was_probing && !self.screens.is_empty() {
+                self.resize = Resize::Available;
+                if self.mode == ScaleMode::Native {
+                    self.request_native_size(false).await?;
+                }
             }
         }
         Ok(())
@@ -754,56 +877,41 @@ impl<B: Backend> Session<B> {
         }
     }
 
-    async fn on_terminal(&mut self, event: Event) -> Result<()> {
+    async fn on_terminal(&mut self, event: Event, alternates: KeyAlternates) -> Result<()> {
         match event {
             Event::Key(key) => {
-                // The menu holds the focus while it is up. Escape is what it says
-                // puts it away, and the only key that does; everything else is a
-                // local command or is swallowed. Presses only, or the release of the
-                // chord that opened it would close it before it could be read.
-                if self.show_menu {
-                    if key.kind == KeyEventKind::Press && key.code == KeyCode::Esc {
-                        self.dismiss_menu();
+                if !self.focused {
+                    if key.kind != KeyEventKind::Press {
                         return Ok(());
                     }
-                    // Local commands still work -- the menu is the list of them --
-                    // and a release still reaches the remote, because a key held from
-                    // before the menu opened is down over there until it does.
-                    let locks = self.input.lock_state(&key);
-                    match self.input.on_key_local(key) {
-                        KeyOutcome::Ignored => {}
-                        KeyOutcome::Keys(keys) => {
-                            if !self.view_only {
-                                self.sync_lock_keys(locks).await?;
-                                for key in keys {
-                                    self.send(Input::Key(key)).await?;
-                                }
-                            }
-                        }
-                        // Not `SendPrefix`: nothing typed at the menu belongs to the
-                        // remote, and the menu no longer offers it.
-                        KeyOutcome::Local(Command::SendPrefix) => {}
-                        KeyOutcome::Local(cmd) => self.on_command(cmd).await?,
-                    }
-                    return Ok(());
+                    self.focused = true;
                 }
+                let focus = if self.show_menu {
+                    InputFocus::Menu
+                } else if self.view_only {
+                    InputFocus::ViewOnly
+                } else {
+                    InputFocus::Remote
+                };
                 let locks = self.input.lock_state(&key);
-                match self.input.on_key(key) {
-                    KeyOutcome::Ignored => {}
-                    KeyOutcome::Keys(keys) => {
-                        if !self.view_only {
-                            // Before the keystroke, not after: the whole point is that the
-                            // remote interprets *this* key with the right lock state.
-                            self.sync_lock_keys(locks).await?;
-                            for key in keys {
-                                self.send(Input::Key(key)).await?;
-                            }
-                        }
+                let (keys, command) = self.input.on_key(key, alternates, focus);
+                if !keys.is_empty() {
+                    if let Some(pointer) = self.input.take_pending_motion() {
+                        self.send(Input::Pointer(pointer)).await?;
                     }
-                    KeyOutcome::Local(cmd) => self.on_command(cmd).await?,
+                    self.sync_lock_keys(locks).await?;
+                    for key in keys {
+                        self.send(Input::Key(key)).await?;
+                    }
+                }
+                if let Some(cmd) = command {
+                    self.on_command(cmd).await?;
                 }
             }
             Event::Mouse(mouse) => {
+                if !self.focused {
+                    return Ok(());
+                }
                 // Move the drawn cursor first and unconditionally: it is a local
                 // overlay, so it should keep up with the hand even while a frame is in
                 // flight.
@@ -814,6 +922,19 @@ impl<B: Backend> Session<B> {
                 self.pointer_px = Some((tx, ty));
                 let at = self.renderer.layout().terminal_px_to_dst(tx, ty);
                 self.renderer.move_cursor(at);
+
+                let continuing =
+                    matches!(mouse.kind, MouseEventKind::Up(_) | MouseEventKind::Drag(_));
+                let targets = self
+                    .presentation
+                    .targets_for(self.metrics)
+                    .filter(|_| self.pending_metrics.is_none());
+                // A former footer can now lie inside the remote image. Wait for
+                // the new geometry before accepting a press. An existing remote
+                // drag still owns its motion and release.
+                if self.presentation.has_replies && targets.is_none() && !continuing {
+                    return Ok(());
+                }
 
                 // The popup is offered the pointer before the menu is, because it is
                 // drawn over the menu: half the notes there are arrive from a menu item,
@@ -838,6 +959,23 @@ impl<B: Backend> Session<B> {
                     return Ok(());
                 }
 
+                // The visible menu owns the whole grid until its dismissal is
+                // acknowledged. A remote drag still owns its drag and release.
+                if !continuing
+                    && !self.show_menu
+                    && (self.presentation.menu_owns_pointer()
+                        || (!self.presentation.has_replies
+                            && self.writer.mouse_reporting_disabled()))
+                {
+                    return Ok(());
+                }
+                if pressed && let Some(command) = targets.and_then(|t| t.footer.at(col, row)) {
+                    if command != Command::Quit || self.show_menu {
+                        self.on_command(command).await?;
+                    }
+                    return Ok(());
+                }
+
                 // The menu takes the rest of the pointer while it is up. Nothing goes
                 // through to the remote: a click meant for a menu item must not also land
                 // on whatever is behind it.
@@ -847,23 +985,22 @@ impl<B: Backend> Session<B> {
                     if on_close {
                         self.menu.clear_hover();
                     } else {
-                        self.on_menu_mouse(mouse).await?;
+                        self.on_menu_mouse(mouse, col, row, targets.and_then(|t| t.menu))
+                            .await?;
                     }
                     return Ok(());
                 }
 
                 if !self.view_only {
-                    let events = {
-                        let layout = *self.renderer.layout();
-                        self.input.on_mouse(mouse, &layout, &self.metrics)
-                    };
-                    for event in events {
-                        self.send(Input::Pointer(event)).await?;
+                    let layout = self.renderer.layout();
+                    for event in self.input.on_mouse(mouse, layout, &self.metrics) {
+                        self.send(event).await?;
                     }
                 }
             }
             Event::Paste(text) => {
-                if !self.view_only && !self.no_clipboard {
+                self.focused = true;
+                if !self.show_menu && !self.view_only && !self.no_clipboard {
                     self.paste_to_remote(text).await?;
                 }
             }
@@ -873,10 +1010,18 @@ impl<B: Backend> Session<B> {
                 self.pending_metrics = Some(Instant::now());
             }
             Event::FocusLost => {
-                // Whatever is held here is not held there.
+                self.focused = false;
+                // Whatever is held here is not held there, and a background window
+                // should stop tracking or hovering the pointer while another app is active.
                 self.release_input().await;
+                self.toast.set_hover(false);
+                self.menu.clear_hover();
+                self.pointer_px = None;
+                self.renderer.move_cursor(None);
             }
-            Event::FocusGained => {}
+            Event::FocusGained => {
+                self.focused = true;
+            }
         }
         Ok(())
     }
@@ -884,11 +1029,12 @@ impl<B: Backend> Session<B> {
     async fn on_command(&mut self, cmd: Command) -> Result<()> {
         match cmd {
             Command::Quit => self.quit = true,
-            Command::SendPrefix => {
-                if !self.view_only {
-                    for key in self.input.literal_prefix() {
-                        self.send(Input::Key(key)).await?;
-                    }
+            Command::SendF8 => {
+                if self.view_only {
+                    self.set_note("View-only mode is on".into());
+                } else {
+                    self.send_key_tap(crate::term::keysym::F8).await?;
+                    self.dismiss_menu();
                 }
             }
             Command::FullRefresh => {
@@ -925,6 +1071,12 @@ impl<B: Backend> Session<B> {
                 }
             }
             Command::ToggleViewOnly => {
+                if self.backend.is_read_only() {
+                    self.set_note(
+                        "View-only password. Reconnect without --view-only to enable input.".into(),
+                    );
+                    return Ok(());
+                }
                 self.view_only = !self.view_only;
                 if self.view_only {
                     self.release_input().await;
@@ -956,7 +1108,9 @@ impl<B: Backend> Session<B> {
                 if self.show_menu {
                     self.dismiss_menu();
                 } else {
+                    self.release_input().await;
                     self.show_menu = true;
+                    self.menu_dirty = true;
                 }
             }
         }
@@ -980,19 +1134,29 @@ impl<B: Backend> Session<B> {
 
     /// Point at the menu, and run whatever is clicked on.
     ///
-    /// A click runs its command and leaves the menu up. Only the dismissal takes it
-    /// down -- the word in the title, the escape key, or the toggle at the top, which
-    /// are three ways of asking for the same thing. So panning twice is two clicks
-    /// rather than two trips through the menu, and picking a scaling mode shows the
-    /// brackets move to it.
+    /// Commands keep the menu open until the user dismisses it, so picking a
+    /// scaling mode shows the brackets move to the new choice.
     ///
     /// A click that lands on nothing does nothing, off the box included: the menu has
     /// the focus, so there is nothing behind it to click on.
-    async fn on_menu_mouse(&mut self, ev: MouseEvent) -> Result<()> {
-        let (col, row) = self.input.terminal_cell(&ev, &self.metrics);
-        let hit = self.menu.hit(&self.metrics, col, row);
+    async fn on_menu_mouse(
+        &mut self,
+        ev: MouseEvent,
+        col: u16,
+        row: u16,
+        displayed: Option<menu::Viewport>,
+    ) -> Result<()> {
+        let hit = self.menu.hit_in(displayed, col, row);
         match ev.kind {
-            MouseEventKind::Moved | MouseEventKind::Drag(_) => self.menu.set_hover(hit),
+            MouseEventKind::Moved | MouseEventKind::Drag(_) => {
+                self.menu.set_hover(self.menu.hit(&self.metrics, col, row));
+            }
+            MouseEventKind::ScrollUp | MouseEventKind::ScrollDown if hit != Hit::Outside => {
+                self.menu
+                    .scroll(&self.metrics, ev.kind == MouseEventKind::ScrollDown);
+                self.menu.set_hover(self.menu.hit(&self.metrics, col, row));
+                self.menu_dirty = true;
+            }
             MouseEventKind::Down(MouseButton::Left) => {
                 if let Hit::Item { command, .. } = hit {
                     self.on_command(command).await?;
@@ -1018,9 +1182,8 @@ impl<B: Backend> Session<B> {
     /// back as damage so the picture under them is drawn again.
     fn dismiss_menu(&mut self) {
         self.show_menu = false;
-        // Or the row the pointer happened to be on would be lit the next time the
-        // menu opens, before the pointer has moved to say so.
-        self.menu.clear_hover();
+        self.menu.reset();
+        self.menu_dirty = true;
     }
 
     async fn on_tick(&mut self) -> Result<()> {
@@ -1039,7 +1202,7 @@ impl<B: Backend> Session<B> {
         {
             self.pending_metrics = None;
             self.metrics_applied_at = Some(Instant::now());
-            self.metrics = Metrics::query()?;
+            self.metrics = self.metrics.refreshed()?;
             tracing::debug!(
                 "applying resize after {:?}: {}x{} cells, {}x{} px",
                 at.elapsed(),
@@ -1061,7 +1224,8 @@ impl<B: Backend> Session<B> {
         self.probe_round_trip().await?;
 
         // A pointer that stopped moving mid-rate-limit still has to arrive.
-        if !self.view_only
+        if self.focused
+            && !self.view_only
             && let Some(pointer) = self.input.flush_motion()
         {
             self.send(Input::Pointer(pointer)).await?;
@@ -1126,9 +1290,14 @@ impl<B: Backend> Session<B> {
 
         for (name, keysym) in corrections {
             tracing::debug!("correcting remote {name}");
-            for down in [true, false] {
-                self.send(Input::Key(Key { keysym, down })).await?;
-            }
+            self.send_key_tap(keysym).await?;
+        }
+        Ok(())
+    }
+
+    async fn send_key_tap(&self, keysym: u32) -> Result<()> {
+        for down in [true, false] {
+            self.send(Input::Key(Key { keysym, down })).await?;
         }
         Ok(())
     }
@@ -1188,10 +1357,22 @@ impl<B: Backend> Session<B> {
     }
 
     fn draw(&mut self) -> Result<()> {
+        // Without a presentation reply we cannot hit-test an on-screen menu.
+        // Queue mouse-off before painting it, even if the writer was full.
+        if self.show_menu
+            && !self.presentation.has_replies
+            && !self.writer.mouse_reporting_disabled()
+        {
+            return Ok(());
+        }
         // A note that has run out has to come off the screen: work of its own, whether or
         // not a frame arrived.
         let expired = self.toast.expire();
-        if !self.renderer.has_work() && !expired && self.pending_cleanup.is_empty() {
+        if !self.renderer.has_work()
+            && !self.menu_dirty
+            && !expired
+            && self.pending_cleanup.is_empty()
+        {
             // Still repaint the status line often enough for the clock-like
             // fields to stay honest, but not every tick.
             if self.fps.since_last() < Duration::from_millis(500) {
@@ -1223,7 +1404,7 @@ impl<B: Backend> Session<B> {
             // and the wipe that used to go out on its own.
             buf.extend_from_slice(b"\x1b[2J");
         }
-        self.render_chrome(&mut buf);
+        let targets = self.render_chrome();
         for cells in self.chrome.flush(&mut buf) {
             self.renderer
                 .mark_cells(cells.x, cells.y, cells.width, cells.height);
@@ -1242,10 +1423,20 @@ impl<B: Backend> Session<B> {
             kitty::end_sync(&mut buf);
         }
 
+        let changed = self.presentation.changed(targets);
+        if changed {
+            // The reply is ordered with mouse input and follows the completed
+            // sync block, even when write_all has only copied it into the PTY.
+            buf.extend_from_slice(self.presentation.query.request());
+        }
         match self.writer.submit(buf) {
             Ok(()) => {
+                if changed {
+                    self.presentation.submitted(targets);
+                }
                 self.renderer.commit();
                 self.chrome.commit();
+                self.menu_dirty = false;
                 self.fps.tick();
             }
             Err(Busy::Full(buf)) => {
@@ -1263,27 +1454,50 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    /// Render every piece of chrome into the plane, and place the images they sit on.
+    /// Render the status line, menu and notification into the same cell buffer.
     ///
     /// In the order they stack: the bar, then the menu over the picture, then a note over
     /// the menu -- a note that arrives while the menu is open belongs on top of it.
-    fn render_chrome(&mut self, out: &mut Vec<u8>) {
-        self.render_status();
-        if self.show_menu {
-            let state = self.menu_state();
-            self.menu
-                .render(&mut self.chrome, out, &self.metrics, state);
+    /// A reply to this frame's query makes its click targets current.
+    fn render_chrome(&mut self) -> MouseTargets {
+        if self.show_menu && self.metrics.image_rows() == 0 {
+            return MouseTargets {
+                metrics: self.metrics,
+                menu_open: true,
+                menu: None,
+                footer: status::compact_menu(
+                    self.chrome.buffer(),
+                    &self.metrics,
+                    self.theme.palette(),
+                ),
+            };
         }
+        let footer = status::FooterActions {
+            menu: self.render_status(),
+            ..Default::default()
+        };
+        let menu = if self.show_menu {
+            let state = self.menu_state();
+            self.menu.render(self.chrome.buffer(), &self.metrics, state)
+        } else {
+            None
+        };
         self.toast
-            .render(&mut self.chrome, out, &self.metrics, self.theme.palette());
+            .render(self.chrome.buffer(), &self.metrics, self.theme.palette());
+        MouseTargets {
+            metrics: self.metrics,
+            menu_open: self.show_menu,
+            menu,
+            footer,
+        }
     }
 
-    fn render_status(&mut self) {
+    fn render_status(&mut self) -> ratatui::layout::Rect {
         let layout = *self.renderer.layout();
         // What this is connected to, which is the one thing on the left worth reading
         // without looking for it.
         let name = if self.server_name.is_empty() {
-            " desktui".to_string()
+            " tvnc".to_string()
         } else {
             format!(" {}", self.server_name)
         };
@@ -1297,52 +1511,51 @@ impl<B: Backend> Session<B> {
             rest.push_str("  view-only");
         }
 
-        // The one binding worth naming, because it opens the menu the rest of them are
-        // listed in. It keeps the ink when the statistics crowd the words out.
-        // Lower case, as the menu writes its shortcuts: the two should read alike.
-        let key = format!("ctrl+{} p", self.input.prefix());
-        let (figures, label) = if self.show_stats {
+        let menu_key = self.input.menu_key();
+        let figures = if self.show_stats {
             // Ours, then theirs. An update rate far below the frame rate is a server that
             // cannot keep up, and no amount of work on this side will move it.
-            (
-                format!(
-                    "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>5.1} up/s  {:>6} /up  \
+            format!(
+                "{:>5.1} fps  {:>3} tiles  {:>6}/f  {:>5.1} up/s  {:>6} /up  \
                      {:>5.2} MP  {:>6} rtt  {} dropped  ",
-                    self.fps.fps(),
-                    self.last_stats.tiles,
-                    human_bytes(self.last_stats.bytes),
-                    self.updates.fps(),
-                    format_rtt(self.delivery),
-                    self.last_update_pixels as f64 / 1e6,
-                    format_rtt(self.rtt),
-                    self.dropped,
-                ),
-                " ".to_string(),
+                self.fps.fps(),
+                self.last_stats.tiles,
+                human_bytes(self.last_stats.bytes),
+                self.updates.fps(),
+                format_rtt(self.delivery),
+                self.last_update_pixels as f64 / 1e6,
+                format_rtt(self.rtt),
+                self.dropped,
             )
         } else {
-            (
-                format!("{:>6}  ", format_rtt(self.rtt)),
-                " commands ".into(),
-            )
+            format!("{:>6}  ", format_rtt(self.rtt))
         };
 
-        // Lit while the prefix waits on its key. The dot is what catches the eye and
-        // the word is what it means: the next key is a command, not a keystroke. In the
-        // colour the menu picks things out with, so the light and the box it is about
-        // read as the same idea.
         let ink = self.theme.palette();
-        let mut left = vec![ink.bright(&name), ink.text(&rest)];
-        if self.input.is_armed() {
-            left.push(ink.accent("  ● CMD"));
+        let mut key = ink.bright(match menu_key {
+            MenuKey::F8 => "F8",
+            MenuKey::None => "commands",
+        });
+        let cols = usize::from(self.metrics.cols);
+        if key.width() > cols {
+            key = ink.bright(if cols >= 4 { "menu" } else { "M" });
         }
-
+        let label = if !self.show_stats
+            && menu_key != MenuKey::None
+            && key.width() + " commands".len() < cols
+        {
+            " commands"
+        } else {
+            ""
+        };
         status::render(
             self.chrome.buffer(),
             &self.metrics,
             ink,
-            left,
-            vec![ink.text(&figures), ink.bright(&key), ink.text(&label)],
-        );
+            vec![ink.bright(&name), ink.text(&rest)],
+            vec![ink.text(&figures)],
+            vec![key, ink.text(label)],
+        )
     }
 
     fn relayout(&mut self) {
@@ -1406,18 +1619,6 @@ impl<B: Backend> Session<B> {
         Ok(())
     }
 
-    /// Put the server's clipboard on the local one, with OSC 52.
-    fn copy_to_local_clipboard(&mut self, text: &str) {
-        use base64::Engine as _;
-        let encoded = base64::engine::general_purpose::STANDARD.encode(text.as_bytes());
-        let mut buf = self.writer.take_buffer();
-        buf.extend_from_slice(b"\x1b]52;c;");
-        buf.extend_from_slice(encoded.as_bytes());
-        buf.extend_from_slice(b"\x07");
-        let _ = self.writer.submit_blocking(buf);
-        self.set_note("remote clipboard copied".into());
-    }
-
     /// Put a note up in the notification popup.
     fn set_note(&mut self, note: String) {
         tracing::debug!("{note}");
@@ -1478,6 +1679,53 @@ fn decode_jpeg(data: &[u8]) -> Result<(u32, u32, Vec<u8>)> {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    fn mouse_targets(cols: u16) -> MouseTargets {
+        MouseTargets {
+            metrics: Metrics {
+                cols,
+                rows: 5,
+                px_w: u32::from(cols) * 8,
+                px_h: 80,
+                cell_w: 8,
+                cell_h: 16,
+            },
+            menu_open: false,
+            menu: None,
+            footer: Default::default(),
+        }
+    }
+
+    #[test]
+    fn returning_to_the_original_grid_waits_for_the_intervening_resize() {
+        let mut presentation = Presentation::new(FrameQuery::DeviceAttributes, true);
+        let original = mouse_targets(80);
+        presentation.submitted(original);
+        presentation.acknowledge();
+        presentation.submitted(mouse_targets(120));
+        presentation.submitted(original);
+
+        assert!(presentation.targets_for(original.metrics).is_none());
+        presentation.acknowledge();
+        assert!(presentation.targets_for(original.metrics).is_none());
+        presentation.acknowledge();
+        assert!(presentation.targets_for(original.metrics).is_some());
+    }
+
+    #[test]
+    fn a_late_reply_never_activates_a_newer_layout() {
+        let mut presentation = Presentation::new(FrameQuery::DeviceAttributes, true);
+        for width in 1..=(Presentation::MAX_PENDING + 1) as u16 {
+            presentation.submitted(mouse_targets(width));
+        }
+        presentation.acknowledge();
+        assert!(
+            presentation.displayed.is_none(),
+            "the oldest snapshot was discarded"
+        );
+        presentation.acknowledge();
+        assert_eq!(presentation.displayed.unwrap().metrics.cols, 2);
+    }
 
     #[test]
     fn an_unsupported_or_refused_resize_explains_itself() {

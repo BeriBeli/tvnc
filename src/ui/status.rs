@@ -8,27 +8,66 @@ use ratatui::widgets::Widget;
 
 use super::theme::{Palette, colour};
 use crate::term::Metrics;
+use crate::term::input::Command;
+
+#[derive(Clone, Copy, Default, PartialEq, Eq)]
+pub struct FooterActions {
+    pub menu: Rect,
+    pub quit: Rect,
+}
+
+impl FooterActions {
+    pub fn at(&self, col: u16, row: u16) -> Option<Command> {
+        let at = ratatui::layout::Position::new(col, row);
+        if self.menu.contains(at) {
+            Some(Command::Menu)
+        } else if self.quit.contains(at) {
+            Some(Command::Quit)
+        } else {
+            None
+        }
+    }
+}
+
+/// In a one-row pane, the modal menu uses the footer itself.
+pub fn compact_menu(buf: &mut Buffer, metrics: &Metrics, ink: &Palette) -> FooterActions {
+    let row = Rect::new(0, 0, metrics.cols, metrics.rows.min(1));
+    buf.set_style(row, Style::new().bg(colour(ink.bar)).fg(colour(ink.text)));
+    let quit_label = if row.width >= 8 { "q Quit" } else { "q" };
+    let quit = Rect::new(0, 0, row.width.min(quit_label.len() as u16), row.height);
+    Line::from(ink.bright(quit_label)).render(quit, buf);
+    let free = row.width - quit.width;
+    let close = if free >= 10 {
+        "Esc Close"
+    } else if free >= 1 {
+        "x"
+    } else {
+        ""
+    };
+    let menu = Rect::new(
+        row.width - close.len() as u16,
+        0,
+        close.len() as u16,
+        row.height,
+    );
+    Line::from(ink.bright(close)).render(menu, buf);
+    FooterActions { menu, quit }
+}
 
 /// Draw the status line on the bottom row, in `ink`.
 ///
-/// The bar has colours of its own rather than the terminal's reverse video, which
-/// followed whatever the theme was set to -- a light band under a light one, a dark
-/// band under a dark one, the same escape making two different pieces of chrome. It
-/// can have them because this is the row below the image area: no graphics placement
-/// is ever put on it, so a colour set on its cells is the colour that shows. The menu
-/// has no such luxury, which is why its backdrop is an image.
-///
-/// `left` is truncated before `right` is dropped: the right-hand side carries the
-/// frame statistics, which are the first thing to go when space runs out.
+/// Reserve the clickable shortcut first, then fit the name and statistics into
+/// the remaining cells. The returned rectangle covers the visible shortcut.
 pub fn render(
     buf: &mut Buffer,
     metrics: &Metrics,
     ink: &Palette,
     left: Vec<Span>,
     right: Vec<Span>,
-) {
+    shortcut: Vec<Span>,
+) -> Rect {
     if metrics.cols == 0 || metrics.rows == 0 {
-        return;
+        return Rect::default();
     }
     let area = Rect {
         x: 0,
@@ -41,19 +80,38 @@ pub fn render(
     // whether or not the text reaches the end.
     buf.set_style(area, Style::new().bg(colour(ink.bar)).fg(colour(ink.text)));
 
+    let shortcut = Line::from(shortcut);
+    let width = shortcut.width();
+    let mut content = area;
+    let mut hit = Rect::default();
+    if width > 0 && width <= usize::from(area.width) {
+        let width = width as u16;
+        let start = (area.width - width).saturating_sub(1);
+        hit = Rect::new(start, area.y, width, 1);
+        shortcut.render(hit, buf);
+        content.width = start;
+    }
     let left = Line::from(left);
     let right = Line::from(right).right_aligned();
     // Widths as they will be drawn rather than counts of characters: a server that
     // names itself in something wider than Latin-1 would otherwise be measured short
     // and push the statistics off the end.
-    let both = left.width() + right.width() < usize::from(metrics.cols);
+    let both = left.width() + right.width() < usize::from(content.width);
 
     // Rendered into the same row, one aligned each way. Whatever does not fit is
     // clipped at the edge, so the row is exactly its own width however long the text.
-    left.render(area, buf);
+    let left_width = content.width.saturating_sub(u16::from(!hit.is_empty()));
+    left.render(
+        Rect {
+            width: left_width,
+            ..content
+        },
+        buf,
+    );
     if both {
-        right.render(area, buf);
+        right.render(content, buf);
     }
+    hit
 }
 
 #[cfg(test)]
@@ -82,7 +140,7 @@ mod tests {
     /// buffer is just the bar's row, so what lands in `out` is the row and nothing else.
     fn draw(out: &mut Vec<u8>, m: &Metrics, ink: &Palette, left: Vec<Span>, right: Vec<Span>) {
         let mut buf = Buffer::empty(Rect::new(0, m.rows.saturating_sub(1), m.cols, 1));
-        render(&mut buf, m, ink, left, right);
+        render(&mut buf, m, ink, left, right, vec![]);
         super::super::paint::write_cells(out, &buf);
     }
 
@@ -195,11 +253,7 @@ mod tests {
             &m,
             ink,
             vec![ink.bright(" a-server"), ink.text("  1600x832  native 1:1")],
-            vec![
-                ink.text("23ms  "),
-                ink.bright("ctrl+a p"),
-                ink.text(" commands "),
-            ],
+            vec![ink.text("23ms  "), ink.bright("F8"), ink.text(" commands ")],
         );
         let text_of = String::from_utf8(out.clone()).unwrap();
         let inks: Vec<&str> = text_of
@@ -218,35 +272,7 @@ mod tests {
         // The name and the key are the bright ones, and they are the only ones.
         let body = body(&out, 10);
         assert!(body.starts_with(" a-server"));
-        assert!(body.ends_with("ctrl+a p commands "));
-    }
-
-    #[test]
-    fn the_prefix_mark_is_the_menu_colour() {
-        // Not a third colour of the bar's own: it is the menu's accent, so the light
-        // and the menu it is about are the same idea. One constant serves both.
-        let ink = ink();
-        let mut out = Vec::new();
-        draw(
-            &mut out,
-            &metrics(40, 10),
-            ink,
-            vec![ink.text(" a-server"), ink.accent("  ● CMD")],
-            vec![],
-        );
-        let text = String::from_utf8(out).unwrap();
-        let inked = text
-            .split(&fg(ink.accent))
-            .nth(1)
-            .expect("the accent was never used");
-        assert!(
-            inked
-                .split("\x1b[0m")
-                .next()
-                .unwrap_or("")
-                .contains("● CMD"),
-            "the accent is on something other than the mark: {text:?}"
-        );
+        assert!(body.ends_with("F8 commands "));
     }
 
     #[test]

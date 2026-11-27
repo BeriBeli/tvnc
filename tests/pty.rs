@@ -95,14 +95,17 @@ fn renders_frames_and_restores_the_terminal() {
     assert!(contains(&frames, b"\x1b[?1003h"), "motion reporting off");
     assert!(contains(&frames, b"\x1b[?1016h"), "pixel mouse not enabled");
     assert!(
-        contains(&frames, b"\x1b[>11u"),
+        contains(&frames, b"\x1b[>15u"),
         "kitty keyboard not enabled"
     );
     assert!(
         contains(&frames, b"\x1b[?2026h"),
         "frames are not synchronised"
     );
-    assert!(contains(&frames, b"z=-1"), "images must sit below text");
+    assert!(
+        contains(&frames, b",z=-1073741825,"),
+        "desktop tiles must sit below explicit cell backgrounds"
+    );
     assert!(contains(&frames, b"o=z"), "payload should be compressed");
     assert!(
         contains(&frames, b"C=1"),
@@ -217,6 +220,31 @@ fn refuses_a_terminal_without_graphics_without_touching_the_screen() {
 }
 
 #[test]
+fn a_mouse_only_menu_requires_a_terminal_that_can_confirm_frames() {
+    let mut term = FakeTerm::spawn(
+        80,
+        24,
+        640,
+        384,
+        &["127.0.0.1::0", "--force", "--menu-key", "none"],
+    );
+    term.answer_probe(b"");
+    let status = term
+        .wait(Duration::from_secs(5))
+        .expect("should exit before connecting");
+    assert!(!status.success());
+    let output = term.output();
+    for hint in [b"--menu-key none".as_slice(), b"--menu-key f8"] {
+        assert!(
+            contains(&output, hint),
+            "missing menu-key diagnostic: {}",
+            show(&output)
+        );
+    }
+    assert!(!contains(&output, b"\x1b[?1049h"));
+}
+
+#[test]
 fn print_caps_reports_both_geometry_sources_and_flags_a_mismatch() {
     let mut term = FakeTerm::spawn(100, 30, 800, 480, &["--print-caps"]);
     // Deliberately disagree with the pty's own size: this is the HiDPI trap the
@@ -241,6 +269,49 @@ fn print_caps_reports_both_geometry_sources_and_flags_a_mismatch() {
         text.contains("warning"),
         "a disagreement between the two must be called out: {text}"
     );
+}
+
+#[test]
+fn a_cell_only_pattern_uses_the_startup_probe_and_resizes_without_reading_keys() {
+    let timeout = Duration::from_secs(10);
+    let mut term = FakeTerm::spawn(200, 50, 0, 0, &["--test-pattern", "--fps", "20"]);
+    term.answer_probe(DIRECT_ONLY_REPLIES);
+    assert!(
+        term.wait_for(b"1600x833", timeout),
+        "missing startup geometry"
+    );
+
+    term.resize(90, 25, 0, 0);
+    assert!(
+        common::session::wait_for_text(&term, "720x408", timeout),
+        "missing resized frame"
+    );
+    term.send(b"h");
+    assert!(common::session::wait_for_text(
+        &term,
+        "Command menu",
+        timeout
+    ));
+    // A fresh kernel measurement includes font changes. The next grid-only
+    // resize should use these 10x20 cells as well.
+    term.resize(90, 25, 900, 500);
+    assert!(common::session::wait_for_text(&term, "900x480", timeout));
+    term.resize(100, 26, 0, 0);
+    assert!(common::session::wait_for_text(&term, "1000x500", timeout));
+    assert_eq!(count(&term.output(), b"\x1b[14t"), 1);
+    term.send(b"q");
+    assert!(term.wait(timeout).unwrap().success());
+}
+
+#[test]
+fn print_caps_can_derive_geometry_from_a_cell_size_reply_alone() {
+    let mut term = FakeTerm::spawn(80, 24, 0, 0, &["--print-caps"]);
+    term.answer_probe(b"\x1b[6;20;10t\x1b[?62;22c");
+    assert!(term.wait(Duration::from_secs(10)).unwrap().success());
+    let out = term.output();
+    assert!(contains(&out, b"ioctl pixel area     (not reported)"));
+    assert!(contains(&out, b"usable image area    800 x 460 pixels"));
+    assert_eq!(count(&out, b"\x1b[14t"), 1);
 }
 
 #[test]
@@ -545,6 +616,38 @@ fn focus_reporting_is_enabled_so_held_keys_can_be_released() {
         contains(&term.output(), b"\x1b[?1004l"),
         "focus reporting was left on at exit"
     );
+}
+
+#[test]
+fn test_pattern_pauses_mouse_tracking_when_unfocused() {
+    let mut term = FakeTerm::spawn(200, 50, 1600, 850, &["--test-pattern", "--fps", "20"]);
+    term.answer_probe(GHOSTTY_REPLIES);
+    let timeout = Duration::from_secs(10);
+    assert!(term.wait_for(b"\x1b_Ga=T", timeout));
+
+    let before_lost = term.output().len();
+    term.send(b"\x1b[O");
+    assert!(
+        term.wait_for_after(before_lost, b"\x1b[?1003l", timeout)
+            .is_some(),
+        "focus loss did not disable mouse motion reporting: {}",
+        show(&term.output()[before_lost..])
+    );
+
+    let after_lost = term.output().len();
+    // A delayed q repeat from before focus loss must not quit the pattern.
+    term.send(b"\x1b[113;1:2u");
+    term.send(b"\x1b[I");
+    assert!(
+        term.wait_for_after(after_lost, b"\x1b[?1003h", timeout)
+            .is_some(),
+        "focus gain did not re-enable mouse motion reporting: {}",
+        show(&term.output()[after_lost..])
+    );
+
+    term.send(b"q");
+    let status = term.wait(timeout).expect("did not exit");
+    assert!(status.success());
 }
 
 #[test]
